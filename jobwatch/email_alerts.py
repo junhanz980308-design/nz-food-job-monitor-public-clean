@@ -173,6 +173,21 @@ NAV_LABEL = re.compile(r"^(?:unsubscribe|manage (?:job )?alerts?|email preferenc
 MARKETING_LABEL = re.compile(r"^(?:read (?:more|article)|read our newsletter|career advice|job search tips|register for (?:the )?webinar|upgrade(?: to premium)?|learn about premium|recommended reading)$", re.I)
 JOB_CTA = re.compile(r"^(?:view (?:this )?job|view (?:job )?details|apply(?: now| for (?:this )?job)?|job details)$", re.I)
 JOB_ROLE = re.compile(r"\b(?:scientist|technologist|researcher|fellow|postdoc(?:toral)?|engineer|analyst|technician|developer|manager|coordinator|specialist)\b", re.I)
+# Additional title evidence must be a complete occupational label. Keep the
+# existing JOB_ROLE proximity rules unchanged: "quality" near an opaque link
+# is not evidence that the destination is a job.
+QUALITY_JOB_TITLE = re.compile(
+    r"^(?:(?:senior|junior|lead|principal|assistant)\s+){0,2}"
+    r"(?:(?:food|dairy|beverage|ingredients?|manufacturing)\s+)?"
+    r"(?:(?:quality(?: assurance| control)?(?: and food safety)?|qa(?:\s*/\s*qc)?|qc(?:\s*/\s*qa)?|food safety|safety|haccp|food compliance|compliance|regulatory(?: affairs)?)"
+    r"\s+(?:officer|technician|analyst|technologist|specialist|manager|coordinator|auditor|inspector|advisor|adviser|lead|associate)"
+    r"|auditor|inspector)$", re.I)
+
+
+def job_title_role(value):
+    return bool(JOB_ROLE.search(value) or (title_value(value) and QUALITY_JOB_TITLE.fullmatch(value)))
+
+
 CARD_CLASS = re.compile(r"(?:^|[ _-])job[ _-]?(?:card|item|row|result)(?:$|[ _-])", re.I)
 TITLE_SELECTOR = "h1, h2, h3, h4, [class*=title], [class*=Title], strong, b"
 
@@ -304,7 +319,7 @@ def job_card(anchor):
         headings = [n for n in headings if not any(other is not n and any(a is n for a in other.parents) for other in headings)]
         titles = {n.get_text(" ", strip=True).casefold() for n in headings}
         titles.update(anchor_label(a).casefold() for a in parent.find_all("a", href=True)
-                      if title_value(anchor_label(a)) and (identify_job_url(a.get("href", "")) or JOB_ROLE.search(anchor_label(a))))
+                      if title_value(anchor_label(a)) and (identify_job_url(a.get("href", "")) or job_title_role(anchor_label(a))))
         nested_cards = [n for n in parent.find_all(["article", "li", "div", "table", "tr"]) if explicit_card(n)]
         # Separate linked rows without an explicit card boundary are ambiguous;
         # don't borrow a canonical job from the neighboring row.
@@ -492,7 +507,7 @@ def prepare_links(html, text, platform, resolver, counter):
                 return "navigation"
         except (ValueError, TypeError):
             pass
-        if JOB_ROLE.search(label) and title_value(label):
+        if job_title_role(label) and title_value(label):
             return "job_title"
         if JOB_CTA.fullmatch(label):
             return "job_cta"
@@ -685,7 +700,7 @@ def extract_jobs_from_text(text: str) -> list[Job]:
         # Multiline SEEK card metadata is not a title. Its exact title/company
         # pairing is handled against the structured HTML, never guessed here.
         lines = [line.strip() for line in task["context"].splitlines() if line.strip()]
-        if len(lines) > 1 and not JOB_ROLE.search(candidate):
+        if len(lines) > 1 and not job_title_role(candidate):
             continue
         if title_value(candidate):
             jobs[url] = Job(f"{platform} email alert", ident, candidate, description=candidate, url=url)
