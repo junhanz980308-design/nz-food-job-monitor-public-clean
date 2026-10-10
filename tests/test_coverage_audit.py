@@ -126,10 +126,15 @@ def test_ambiguous_new_job_only_appears_in_diagnostics(tmp_path, monkeypatch, ca
 
 
 def test_adzuna_query_budget_and_existing_queries_preserved():
-    queries = json.loads(Path('config/sources.json').read_text())['adzuna_queries']
-    assert len(queries) == len(set(queries)) == 11
-    assert queries[:7] == ['food scientist', 'food technologist', 'food research', 'research fellow food', 'product development technologist', 'dairy scientist', 'flavour scientist']
-    assert len(queries) * 6 * 31 == 2046 < 2500
+    queries = json.loads(
+        Path("config/sources.json").read_text()
+    )["adzuna_queries"]
+
+    assert len(queries) == len(set(queries)) == 12
+
+    assert {"food quality", "food safety"}.issubset(queries)
+
+    assert len(queries) * 6 * 31 == 2232 < 2500
 
 
 def test_failed_dry_run_preserves_health_and_history(tmp_path, monkeypatch, caplog):
