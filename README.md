@@ -1,6 +1,6 @@
 # NZ Food Job Monitor — public code edition
 
-Monitor New Zealand food science, R&D, product development and related research roles. Telegram receives HIGH MATCH and POSSIBLE MATCH alerts. Ambiguous roles remain visible in read-only diagnostic summaries. Scoring never assumes visa sponsorship.
+Monitor New Zealand food science, R&D, product development, related research, and food industry quality, safety and compliance roles. Telegram receives HIGH MATCH and POSSIBLE MATCH alerts. Ambiguous roles remain visible in read-only diagnostic summaries. Scoring never assumes visa sponsorship.
 
 This distribution contains application code and synthetic tests only. It has no account credentials, Git history, email messages or previous monitoring records. Scheduled monitoring can run in a public repository on standard GitHub-hosted runners. Runtime history is encrypted before it is written to Git; credentials belong in GitHub Secrets.
 
@@ -16,6 +16,14 @@ python -m pytest -q
 ```
 
 Tests block external network access and use synthetic jobs and email messages. Tests of state persistence use temporary local Git repositories. They do not contact Telegram, Gmail or live job services.
+
+## Food quality and safety matching
+
+Food QA/QC, food safety, HACCP, quality officer/technologist/manager, auditor/inspector and regulatory compliance roles can qualify for POSSIBLE MATCH when the title or duties establish the relevant role and food-industry context. Newly recognized quality roles receive 24 role points and are capped at 69; existing scientific title rules retain their scores and HIGH MATCH priority. Generic quality titles without food evidence remain AMBIGUOUS. Software/IT testing, construction and unrelated pharmaceutical quality are excluded; staff food benefits alone are insufficient. Citizenship and permanent-residency restrictions still override relevance.
+
+The shared scoring rules apply to future email, employer-board and Adzuna results. Existing Adzuna queries and request frequency are unchanged, so this extension adds no API calls and cannot find roles absent from the configured searches. Historical postings are not resent merely because their scores improve; silent baselines and pending-delivery retries retain their existing behavior.
+
+Email parsing recognizes complete quality and compliance job titles while retaining structured card boundaries and title/employer associations. Quality words near an opaque tracker do not establish a job destination. A verified canonical job identity is still required, and unresolved or ambiguous content remains deferred. Synthetic tests cover known jobs alongside ambiguous trackers; they do not establish the identities or safety of acknowledging any outstanding live SEEK messages.
 
 ## Integrations and configuration
 

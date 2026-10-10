@@ -24,6 +24,30 @@ DOMAIN = [
 ]
 NEGATIVE_TITLE = r"\b(?:sales|account manager|marketing|chef|cook|barista|driver|retail|receptionist|software (?:engineer|developer)|data scientist|cybersecurity|finance|electrical engineer)\b"
 UNRELATED = r"\b(?:cyber[ -]?security|cryptograph\w*|astrophysics|cosmology|quantum computing|software development|computer vision|financial modelling|oncology|clinical trials)\b"
+# Quality roles are a separate POSSIBLE-match route. Existing scientific title
+# rules keep their scores and priority, even when their descriptions mention QA.
+QUALITY_ROLE = (
+    r"\b(?:quality (?:assurance|control)|qa(?:\s*/\s*qc)?|qc(?:\s*/\s*qa)?|food safety|haccp|food compliance|regulatory affairs)\b"
+    r"|\b(?:quality|regulatory|compliance)\s+(?:officer|technician|analyst|technologist|specialist|manager|coordinator|auditor|inspector|advisor|adviser|lead|associate)\b"
+    r"|\b(?:food|dairy|beverage|ingredients?)\s+(?:auditor|inspector)\b"
+)
+QUALITY_DUTIES = (
+    r"\b(?:perform|conduct|manage|maintain|implement|monitor|audit|verify|ensure|oversee|coordinate|lead|responsible for)\b"
+    r"[^.;\n]{0,60}\b(?:quality assurance|quality control|food safety|haccp|food compliance|regulatory compliance)\b"
+)
+QUALITY_WRONG_SECTOR = (
+    r"\b(?:software|it|construction|civil|building|concrete)\b"
+)
+QUALITY_SOFTWARE_DUTIES = r"\b(?:software testing|testing software|software qa|test automation|selenium|web application testing|mobile application testing|it testing)\b"
+QUALITY_NONFOOD_DUTIES = r"\b(?:pharma(?:ceutical)?|medicines?|drug products?|medical devices?|clinical|construction|concrete)\b"
+QUALITY_EXPLICIT_FOOD = (
+    r"\b(?:food safety|food quality|food compliance|haccp|dairy quality|beverage quality)\b"
+    r"|\b(?:quality assurance|quality control|regulatory compliance)\s+(?:of|for|in|on)\s+(?:the\s+)?(?:food|dairy|beverage|milk|cheese|meat|grain|cereal)\b"
+)
+# Staff benefits alone do not establish a food-industry remit for a new QA rule.
+QUALITY_PERKS = r"\b(?:(?:free|subsidised|subsidized|complimentary) food|food (?:allowance|vouchers?))\b"
+
+
 RIGHTS_STRICT = (
     r"(?:must|required to|only)\s+(?:be\s+|hold\s+|have\s+)?(?:a\s+)?(?:new zealand|nz)\s+(?:citizen\w*|permanent residen\w*)"
     r"|(?:nz|new zealand)\s+(?:citizens?(?:\s+(?:or|and)\s+permanent residents?)?|permanent residents?)\s+only"
@@ -61,16 +85,30 @@ def match_job(job: Job) -> Match:
         signals.append("context.title_only")
     food = bool(re.search(FOOD, text))
     relevant_tech = bool(re.search(ANALYTICAL, text))
-    unrelated = bool(re.search(NEGATIVE_TITLE, title) or re.search(UNRELATED, text))
+    quality_title = bool(re.search(QUALITY_ROLE, title))
+    quality = not hits and (quality_title or bool(re.search(QUALITY_DUTIES, description)))
+    quality_food = bool(re.search(FOOD, re.sub(QUALITY_PERKS, "", text)))
+    quality_unrelated = quality and bool(
+        re.search(QUALITY_WRONG_SECTOR, title)
+        or re.search(QUALITY_SOFTWARE_DUTIES, description)
+        or (re.search(QUALITY_NONFOOD_DUTIES, text) and not re.search(QUALITY_EXPLICIT_FOOD, text))
+    )
+    if quality:
+        score = min(69, score + 24)
+        reasons.append("食品质量、安全与合规职责" if quality_food else "质量或合规岗位，食品行业背景待确认")
+        signals.append("title.quality" if quality_title else "evidence.quality_duties")
+    unrelated = bool(re.search(NEGATIVE_TITLE, title) or re.search(UNRELATED, text) or quality_unrelated)
+    if quality_unrelated:
+        signals.append("penalty.unrelated_quality")
     if unrelated:
         score -= 70
         signals.append("penalty.unrelated")
-    if not hits and not food:
+    if not hits and not quality and not food:
         score -= 30
         signals.append("penalty.no_relevant_role")
     # NPD/R&D/formulation titles warrant POSSIBLE; generic research/analysis
     # needs food or specific analytical methods. More words alone aren't evidence.
-    ambiguous = bool(hits) and not food and not relevant_tech and "title.development" not in signals
+    ambiguous = (bool(hits) and not food and not relevant_tech and "title.development" not in signals) or (quality and not quality_food)
     if ambiguous:
         score = min(score, 41)
         signals.append("context.insufficient_relevance")
