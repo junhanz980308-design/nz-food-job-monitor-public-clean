@@ -72,6 +72,7 @@ No budget or network allowlist is expanded: 24 HEAD requests per scan, four hops
 | `redirect_access_denied`, `redirect_rate_limited`, `redirect_head_unsupported` | HTTP 401/403, 429 or 405; no bypass/fallback is attempted |
 | `redirect_missing_location`, `redirect_not_http`, `redirect_server_error` | Redirect without Location, non-redirect response or server failure |
 | `redirect_request_budget`, `redirect_time_budget`, `redirect_hop_limit`, `redirect_loop` | Separate resource/loop limits |
+| `ambiguous_card_identity` | The same opaque target appears in separate cards with conflicting canonical identities; do not borrow one identity |
 | `redirect_request_failed`, `missing_title` | Request failure without exception text, or a supported job with no safe title |
 
 Reasons for unresolved targets are counted once per normalized target per message, while classification decisions count occurrences. Repeated messages may still count the same target separately, with a resolver cache hit and no new request. Reasons never contain dynamic hosts, URLs, HTTP response bodies, subjects or addresses.

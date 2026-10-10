@@ -206,3 +206,18 @@ def test_contact_links_do_not_create_false_unresolved_jobs():
     html = '<article><a href="https://nz.seek.com/job/1">Food Scientist</a></article><a href="mailto:synthetic@example.test">Email support</a>'
     jobs, ack, c = parse(html, resolver=mail.RedirectResolver())
     assert ack and len(jobs) == 1 and c["redirect_requests"] == 0
+
+
+def test_shared_opaque_target_in_different_known_cards_is_ambiguous():
+    html = ''.join(f'<article><a href="https://nz.seek.com/job/{i}">Food Scientist</a><a href="https://www.seek.com/click/shared">View job</a></article>' for i in (1, 2))
+    jobs, ack, c = parse(html, resolver=mail.RedirectResolver())
+    assert len(jobs) == 2 and not ack and c["redirect_requests"] == 0
+    assert c["failure_reasons"]["ambiguous_card_identity"] == 1
+
+
+def test_known_card_does_not_satisfy_unknown_card_even_with_shared_target():
+    href = "https://vendor.example.test/click/shared"
+    html = f'<article><a href="https://nz.seek.com/job/1">Food Scientist</a><a href="{href}">View job</a></article><article><h3>Dairy Scientist</h3><a href="{href}">View job</a></article>'
+    jobs, ack, c = parse(html, resolver=mail.RedirectResolver())
+    assert len(jobs) == 1 and not ack
+    assert c["failure_reasons"]["reject_external_domain"] == 1

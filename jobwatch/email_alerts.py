@@ -416,7 +416,7 @@ def prepare_links(html, text, platform, resolver, counter):
             bump(counter, "link_decisions", kind)
             if kind in {"canonical_job", "navigation", "marketing", "other"}:
                 continue
-            known = shared_card_target if kind in {"job_title", "job_cta", "card_link", "ambiguous_tracking"} else None
+            known = shared_card_target if kind in {"job_title", "job_cta", "card_link", "ambiguous_tracking"} and (task["anchor"] is None or known_in_card(task) == shared_card_target) else None
             if known:
                 replace(task, known)
                 counter["canonical_card_reuse"] += 1
@@ -427,12 +427,25 @@ def prepare_links(html, text, platform, resolver, counter):
     # Strong cards first; original document order breaks ties deterministically.
     for rank, key, items in sorted(pending, key=lambda row: row[0]):
         # Another link in this card may have resolved since the first pass.
-        known = known_in_card(items[0]) if items[0]["kind"] in {"job_title", "job_cta", "card_link"} else None
-        if known:
-            for task in items:
-                replace(task, known)
-                counter["canonical_card_reuse"] += 1
+        current_targets = {job[2]: job for task in items if (job := known_in_card(task))}
+        if len(current_targets) > 1:
+            missing = True
+            counter["unsupported_url_patterns"] += 1
+            counter["unresolved_job_targets"] += 1
+            bump(counter, "failure_reasons", "ambiguous_card_identity")
             continue
+        known = next(iter(current_targets.values())) if current_targets else None
+        if known:
+            remaining_items = []
+            for task in items:
+                if task["anchor"] is None or known_in_card(task) == known:
+                    replace(task, known)
+                    counter["canonical_card_reuse"] += 1
+                else:
+                    remaining_items.append(task)
+            if not remaining_items:
+                continue
+            items = remaining_items
         ambiguous = rank == priority["ambiguous_tracking"]
         if ambiguous:
             result, reason = None, "insufficient_job_evidence"
