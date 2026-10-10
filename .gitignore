@@ -1,0 +1,54 @@
+# Local environments, caches and OS files
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
+# Credentials: never force-add these files
+.env
+.env.*
+*.env
+.secrets/
+secrets.*
+secrets/
+secrets.*
+.secrets*
+credentials*
+*credentials*.json
+client_secret*.json
+*token*.json
+*oauth*.json
+secrets*.yaml
+secrets*.yml
+secrets*.toml
+*service_account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.npmrc
+config/local*
+# All live history is private, even when hashed
+state/**
+!state/empty.example.json
+.state-parent
+seen.json
+*.db
+*.sqlite*
+# Private outputs and exports
+logs/
+*.log
+artifacts/
+exports/
+private/
+backups/
+*.bak
+*.zip
+*.tar*
+coverage.xml
+htmlcov/
+.coverage*

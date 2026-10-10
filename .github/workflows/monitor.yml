@@ -1,0 +1,111 @@
+name: NZ Food Job Monitor
+
+on:
+  schedule:
+    # Fast sources every 10 minutes. Times are in UTC, not JST.
+    - cron: "7,17,27,37,47,57 * * * *"
+    # Adzuna 11 queries x 6 checks/day = 2,046 calls/31 days before retries/manual runs.
+    - cron: "13 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "fast = email/ATS, broad = Adzuna, all = both"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - fast
+          - broad
+      dry_run:
+        description: "No Telegram notifications and no persistent state changes"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# Prevent concurrent runs from overwriting source history or double notifying.
+concurrency:
+  group: nz-food-job-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Require default branch for persistent runs
+        if: ${{ !inputs.dry_run && github.ref_name != github.event.repository.default_branch }}
+        run: |
+          echo 'Persistent monitoring must run on the default branch. Use dry_run on other branches.'
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install packages
+        run: python -m pip install -r requirements.txt
+
+      - name: Load latest encrypted history
+        id: history
+        env:
+          MONITOR_STATE_KEY: ${{ secrets.MONITOR_STATE_KEY }}
+        run: python -m scripts.state_branch load
+
+      - name: Run job monitor
+        id: scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GMAIL_OAUTH_TOKEN_JSON: ${{ secrets.GMAIL_OAUTH_TOKEN_JSON }}
+          GMAIL_IMAP_USER: ${{ secrets.GMAIL_IMAP_USER }}
+          GMAIL_IMAP_APP_PASSWORD: ${{ secrets.GMAIL_IMAP_APP_PASSWORD }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            if [[ "$EVENT_SCHEDULE" == "13 */4 * * *" ]]; then MODE="broad"; else MODE="fast"; fi
+          else
+            MODE="${INPUT_MODE:-all}"
+          fi
+          EXTRA=""
+          if [[ "${INPUT_DRY_RUN:-false}" == "true" ]]; then EXTRA="--dry-run"; fi
+          python -m jobwatch.runner --mode "$MODE" $EXTRA
+
+      - name: Persist encrypted history only
+        if: ${{ always() && steps.history.outcome == 'success' && steps.scan.outcome != 'skipped' && (github.event_name == 'schedule' || !inputs.dry_run) }}
+        id: persist
+        env:
+          MONITOR_STATE_KEY: ${{ secrets.MONITOR_STATE_KEY }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python -m scripts.state_branch save
+
+      - name: Keep encrypted recovery history if persistence fails
+        if: ${{ failure() && steps.persist.outcome == 'failure' && hashFiles('state/seen.enc') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-history-recovery-${{ github.run_id }}
+          path: state/seen.enc
+          retention-days: 7
+
+      - name: Remove plaintext runtime files
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f state/seen.json state/seen.tmp .state-parent

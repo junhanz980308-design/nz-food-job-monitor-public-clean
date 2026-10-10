@@ -1,0 +1,24 @@
+{
+  "adzuna_queries": [
+    "food scientist",
+    "food technologist",
+    "food research",
+    "research fellow food",
+    "product development technologist",
+    "dairy scientist",
+    "flavour scientist",
+    "npd technologist",
+    "formulation scientist",
+    "applications technologist",
+    "postdoctoral researcher"
+  ],
+  "ats": [
+    {
+      "type": "smartrecruiters",
+      "name": "SGS",
+      "token": "SGS",
+      "nz_only": true
+    }
+  ],
+  "feeds": []
+}
