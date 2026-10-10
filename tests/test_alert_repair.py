@@ -52,7 +52,7 @@ def test_aria_title_and_partial_unresolved_sibling():
     jobs, ack = mail._parse_email("New jobs", "alert@seek.com", html, "", c)
     assert len(jobs) == 1 and jobs[0].title == "Analytical Scientist" and not ack
     assert c["SEEK"]["unsupported_url_patterns"] == c["SEEK"]["parse_failures"] == 1
-    assert c["SEEK"]["failure_reasons"]["redirect_unresolved"] == 1
+    assert c["SEEK"]["failure_reasons"]["resolution_unavailable"] == 1
 
 
 @pytest.mark.parametrize("destination", [
@@ -74,16 +74,16 @@ def test_unsafe_redirect_destinations_never_requested(destination, monkeypatch):
 def test_private_dns_and_budget_fail_closed(monkeypatch):
     monkeypatch.setattr(mail.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("127.0.0.1", 443))])
     resolver = mail.RedirectResolver()
-    assert resolver.resolve("https://www.seek.com/click/x", "SEEK")[1] == "redirect_not_allowed"
+    assert resolver.resolve("https://www.seek.com/click/x", "SEEK")[1] == "reject_nonpublic_dns"
     resolver.remaining = 0
-    assert resolver.resolve("https://www.seek.com/click/y", "SEEK")[1] == "redirect_budget"
+    assert resolver.resolve("https://www.seek.com/click/y", "SEEK")[1] == "redirect_request_budget"
 
 
 @pytest.mark.parametrize("status", [200, 401, 403, 405, 429])
 def test_no_get_or_access_control_fallback(status, monkeypatch):
     monkeypatch.setattr(mail.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("8.8.8.8", 443))])
     monkeypatch.setattr(mail.requests.Session, "head", lambda *a, **k: MagicMock(status_code=status, headers={}))
-    assert mail.RedirectResolver().resolve("https://www.seek.com/click/x", "SEEK")[1] == "redirect_not_http"
+    assert mail.RedirectResolver().resolve("https://www.seek.com/click/x", "SEEK")[1] == {200: "redirect_not_http", 401: "redirect_access_denied", 403: "redirect_access_denied", 405: "redirect_head_unsupported", 429: "redirect_rate_limited"}[status]
 
 
 @pytest.mark.parametrize("sender,subject", [("news@indeed.com", "Career advice newsletter"), ("updates@linkedin.com", "Recommended reading"), ("news@seek.com", "Job search tips")])
@@ -216,7 +216,7 @@ def test_mixed_scan_failure_counters_are_finite_and_private(monkeypatch):
     mail._parse_email("New jobs", "alerts@seek.com", '<a href="https://www.seek.com/click/opaque?secret=SYNTHETIC-PRIVATE-CONTENT">View job</a>', "", counters, resolver)
     output = json.dumps(counters)
     assert "SYNTHETIC-PRIVATE-CONTENT" not in output and "https://" not in output
-    assert counters["SEEK"]["failure_reasons"]["redirect_request_failed"] == 1
+    assert counters["SEEK"]["failure_reasons"]["redirect_dns_failed"] == 1
 
 
 def test_backfill_workflow_is_manual_silent_and_encrypted():

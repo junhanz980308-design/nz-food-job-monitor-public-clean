@@ -82,7 +82,10 @@ def new_mail_counters() -> dict:
     return {name: dict(emails_checked=0, alerts_recognized=0, links_extracted=0,
                        parse_failures=0, unknown_coverage=0, coverage="not_checked",
                        non_job_emails=0, emails_acknowledged=0, emails_deferred=0,
-                       unsupported_url_patterns=0, failure_reasons={}, url_patterns={})
+                       unsupported_url_patterns=0, failure_reasons={}, url_patterns={},
+                       link_decisions={}, link_occurrences=0, unique_link_targets=0,
+                       duplicate_links=0, canonical_card_reuse=0, redirect_requests=0,
+                       redirect_cache_hits=0, unresolved_job_targets=0, ambiguous_targets=0)
             for name in (*PLATFORM_DOMAINS, "Unknown")}
 
 
@@ -140,6 +143,9 @@ TRACK_PATH = re.compile(r"^/(?:ls/click|ss/c|uni/ss/c|click|clicks|track|trackin
 NON_JOB = re.compile(r"unsubscribe|preferences|privacy|help|settings|login|sign.?in|manage.alert|view.all|see.all|search.jobs|browse.jobs", re.I)
 
 
+NAV_PATH = re.compile(r"^/(?:unsubscribe|preferences|privacy|help|settings|login|sign-in|signin|manage-alerts|jobs/search)(?:/|$)", re.I)
+
+
 def bump(counter, field, label):
     values = counter[field]
     values[label] = values.get(label, 0) + 1
@@ -154,129 +160,318 @@ def url_pattern(href):
             return "direct_or_embedded_job"
         if TRACK_PATH.match(parsed.path):
             return "opaque_first_party_tracker" if trusted_host(parsed.hostname or "") else "opaque_external_tracker"
-        if NON_JOB.search(parsed.path):
+        if NAV_PATH.search(parsed.path):
             return "navigation"
         return "unsupported_first_party" if trusted_host(parsed.hostname or "") else "external_link"
     except (ValueError, TypeError):
         return "unsafe_url"
 
 
-class RedirectResolver:
-    """HEAD-only, first-party tracker resolution; never request a job page/body.
+# Only explicit navigation/marketing evidence is ignored. "Details" is ambiguous.
+NAV_LABEL = re.compile(r"^(?:unsubscribe|manage (?:job )?alerts?|email preferences|preferences|privacy(?: policy)?|terms(?: of use)?|help(?: centre| center)?|settings|sign in|log in|view (?:all|more) jobs|see (?:all|more) jobs|browse jobs|search jobs|save (?:this )?job|share(?: this job)?|company profile|view company|view in browser|contact us|download (?:the )?app|follow us)$", re.I)
+MARKETING_LABEL = re.compile(r"^(?:read (?:more|article)|read our newsletter|career advice|job search tips|register for (?:the )?webinar|upgrade(?: to premium)?|learn about premium|recommended reading)$", re.I)
+JOB_CTA = re.compile(r"^(?:view (?:this )?job|view (?:job )?details|apply(?: now| for (?:this )?job)?|job details)$", re.I)
+JOB_ROLE = re.compile(r"\b(?:scientist|technologist|researcher|fellow|postdoc(?:toral)?|engineer|analyst|technician|developer|manager|coordinator|specialist)\b", re.I)
+CARD_CLASS = re.compile(r"(?:^|[ _-])job[ _-]?(?:card|item|row|result)(?:$|[ _-])", re.I)
+TITLE_SELECTOR = "h1, h2, h3, h4, [class*=title], [class*=Title], strong, b"
 
-    External email vendors, HTML/JS redirects, login flows and GET-only endpoints
-    remain unsupported. A scan-wide request/time budget prevents email amplification.
-    """
+
+def link_key(href):
+    # Drop fragments only: tracking query values can be signed and must survive.
+    try:
+        return urlparse(unwrap_target(href))._replace(fragment="").geturl()
+    except (ValueError, TypeError):
+        return href or ""
+
+
+def anchor_label(anchor):
+    return re.sub(r"\s+", " ", anchor.get_text(" ", strip=True) or anchor.get("aria-label", "")
+                  or anchor.get("title", "") or (anchor.find("img").get("alt", "") if anchor.find("img") else "")).strip()
+
+
+def explicit_card(node):
+    return node.name in {"article", "li"} or node.has_attr("data-job-id") or bool(CARD_CLASS.search(" ".join(node.get("class", []))))
+
+
+def title_value(value):
+    return _valid_title(value) and not NAV_LABEL.fullmatch(value) and not MARKETING_LABEL.fullmatch(value)
+
+
+def job_card(anchor):
+    """Smallest semantic card, growing table rows only while evidence stays singular."""
+    chosen = anchor
+    for parent in list(anchor.parents)[:8]:
+        if parent.name in {"body", "html", "[document]", "footer", "nav"}:
+            break
+        if len(parent.get_text(" ", strip=True)) > 900:
+            break
+        ids = {r[:2] for a in parent.find_all("a", href=True) if (r := identify_job_url(a.get("href", "")))}
+        headings = [n for n in parent.select(TITLE_SELECTOR) if title_value(n.get_text(" ", strip=True))]
+        # Count leaf title nodes, not both a heading and its nested styled span.
+        headings = [n for n in headings if not any(other is not n and any(a is n for a in other.parents) for other in headings)]
+        titles = {n.get_text(" ", strip=True).casefold() for n in headings}
+        titles.update(anchor_label(a).casefold() for a in parent.find_all("a", href=True)
+                      if title_value(anchor_label(a)) and (identify_job_url(a.get("href", "")) or JOB_ROLE.search(anchor_label(a))))
+        nested_cards = [n for n in parent.find_all(["article", "li", "div", "table", "tr"]) if explicit_card(n)]
+        # Separate linked rows without an explicit card boundary are ambiguous;
+        # don't borrow a canonical job from the neighboring row.
+        linked_rows = [row for row in parent.find_all("tr", recursive=False) if row.find("a", href=True)]
+        if parent.name == "table":
+            linked_rows += [row for body in parent.find_all("tbody", recursive=False)
+                            for row in body.find_all("tr", recursive=False) if row.find("a", href=True)]
+        linked_blocks = [node for node in parent.find_all(["div", "td", "li", "table"], recursive=False) if node.find("a", href=True)]
+        split_rows = (len(linked_rows) > 1 or len(linked_blocks) > 1) and bool(ids) and not explicit_card(parent)
+        if len(ids) > 1 or len(headings) > 1 or len(titles) > 1 or nested_cards or split_rows:
+            break
+        if titles or ids:
+            chosen = parent
+        if explicit_card(parent):
+            return parent if titles or ids else anchor
+    return chosen
+
+
+def redirect_rejection(url, platform):
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            return "reject_non_https"
+        if parsed.username is not None or parsed.password is not None:
+            return "reject_userinfo"
+        if parsed.port not in (None, 443):
+            return "reject_port"
+        destination = platform_for_host((parsed.hostname or "").lower())
+        if destination == "Unknown":
+            return "reject_external_domain"
+        if destination != platform:
+            return "reject_cross_platform"
+        if identify_job_url(url):
+            return None
+        if NAV_PATH.search(parsed.path):
+            return "reject_navigation_path"
+        if not TRACK_PATH.match(parsed.path):
+            return "reject_unsupported_path"
+    except (ValueError, TypeError):
+        return "reject_malformed_url"
+    return None
+
+
+class RedirectResolver:
+    """HEAD-only first-party redirects. Never request job pages or loosen budgets."""
     def __init__(self):
         self.cache = {}
         self.remaining = 24
         self.deadline = time.monotonic() + 45
+        self.requests = 0
+        self.cache_hits = 0
 
     def resolve(self, href, platform):
-        key = (href, platform)
-        if key in self.cache:
-            return self.cache[key]
-        current = unwrap_target(href)
+        current = link_key(href)
+        key = (current, platform)
         visited = set()
-        result, reason = None, "redirect_limit"
-        for _ in range(4):
-            if urlparse(current).scheme != "https":
-                reason = "redirect_not_allowed"
+        result, reason = None, "redirect_hop_limit"
+        for hop in range(5):
+            if (current, platform) in self.cache:
+                self.cache_hits += 1
+                result, reason = self.cache[(current, platform)]
+                break
+            reason = redirect_rejection(current, platform)
+            if reason:
                 break
             job = identify_job_url(current)
             if job:
-                result, reason = (job, "resolved") if job[0] == platform else (None, "platform_mismatch")
+                result, reason = job, "resolved"
                 break
+            if current in visited:
+                reason = "redirect_loop"
+                break
+            if hop == 4:
+                reason = "redirect_hop_limit"
+                break
+            if self.remaining <= 0:
+                reason = "redirect_request_budget"
+                break
+            if time.monotonic() >= self.deadline:
+                reason = "redirect_time_budget"
+                break
+            visited.add(current)
             try:
                 parsed = urlparse(current)
-                if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443)
-                        or platform_for_host(parsed.hostname or "") != platform or not TRACK_PATH.match(parsed.path)):
-                    reason = "redirect_not_allowed"
-                    break
-                if current in visited:
-                    reason = "redirect_loop"
-                    break
-                if self.remaining <= 0 or time.monotonic() >= self.deadline:
-                    reason = "redirect_budget"
-                    break
-                visited.add(current)
-                self.remaining -= 1
                 addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
                 if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
-                    reason = "redirect_not_allowed"
+                    reason = "reject_nonpublic_dns"
                     break
-                # No browser cookies, proxy environment, authorization or Gmail headers.
+            except Exception:
+                reason = "redirect_dns_failed"
+                break
+            try:
+                self.remaining -= 1
+                self.requests += 1
                 with requests.Session() as session:
                     session.trust_env = False
                     response = session.head(current, allow_redirects=False, timeout=4)
                     try:
+                        status = response.status_code
                         location = response.headers.get("Location", "")
-                        if response.status_code not in {301, 302, 303, 307, 308} or not location:
-                            reason = "redirect_not_http"
+                        if status not in {301, 302, 303, 307, 308}:
+                            reason = ("redirect_access_denied" if status in {401, 403} else
+                                      "redirect_rate_limited" if status == 429 else
+                                      "redirect_head_unsupported" if status == 405 else
+                                      "redirect_server_error" if status >= 500 else "redirect_not_http")
                             break
-                        current = urljoin(current, location)
+                        if not location:
+                            reason = "redirect_missing_location"
+                            break
+                        current = link_key(urljoin(current, location))
                     finally:
                         response.close()
             except Exception:
                 reason = "redirect_request_failed"
                 break
-        self.cache[key] = (result, reason)
-        return self.cache[key]
+        # Shared intermediate hops are cached as well as starting wrappers.
+        for url in visited | {key[0]}:
+            self.cache[(url, platform)] = (result, reason)
+        return result, reason
 
 
 def prepare_links(html, text, platform, resolver, counter):
     soup = _soup(html)
+    tasks = []
     replacements = {}
+    groups = {}
+    for anchor in soup.find_all("a", href=True):
+        tasks.append(dict(href=anchor.get("href", ""), label=anchor_label(anchor), anchor=anchor, card=job_card(anchor)))
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for i, line in enumerate(lines):
+        for match in re.finditer(r"https?://[^\s<>]+", line):
+            label = line[:match.start()].strip(" :-–") or (lines[i - 1] if i else "")
+            # A preceding URL is not evidence for the next link.
+            if re.search(r"https?://", label):
+                label = ""
+            tasks.append(dict(href=match.group().rstrip(".,;)>"), label=label, anchor=None, card=None))
+    counter["link_occurrences"] += len(tasks)
+    for task in tasks:
+        key = link_key(task["href"])
+        groups.setdefault(key, []).append(task)
+        bump(counter, "url_patterns", url_pattern(task["href"]))
+    counter["unique_link_targets"] += len(groups)
+    counter["duplicate_links"] += len(tasks) - len(groups)
+
+    def classification(task):
+        href, label, anchor, card = (task[k] for k in ("href", "label", "anchor", "card"))
+        direct = identify_job_url(href)
+        if direct:
+            return "canonical_job" if direct[0] == platform else "cross_platform_job"
+        if NAV_LABEL.fullmatch(label):
+            return "navigation"
+        if MARKETING_LABEL.fullmatch(label):
+            if card is not None and card is not anchor and JOB_ROLE.search(card.get_text(" ", strip=True)):
+                return "card_link"
+            return "marketing"
+        try:
+            if urlparse(href).scheme in {"mailto", "tel"}:
+                return "navigation"
+            if NAV_PATH.search(urlparse(unwrap_target(href)).path):
+                return "navigation"
+        except (ValueError, TypeError):
+            pass
+        if JOB_ROLE.search(label) and title_value(label):
+            return "job_title"
+        if JOB_CTA.fullmatch(label):
+            return "job_cta"
+        if card is not None and card is not anchor and (JOB_ROLE.search(card.get_text(" ", strip=True)) or CARD_CLASS.search(" ".join(card.get("class", []))) or card.has_attr("data-job-id")):
+            return "card_link"
+        if "tracker" in url_pattern(href) or url_pattern(href) == "unsafe_url":
+            return "ambiguous_tracking"
+        if re.search(r"/jobs?/", href, re.I):
+            return "unsupported_job_content"
+        return "other"
+
+    def known_in_card(task):
+        card = task["card"]
+        if card is None or card is task["anchor"]:
+            return None
+        known = {r[1]: r for a in card.find_all("a", href=True)
+                 if (r := identify_job_url(a.get("href", ""))) and r[0] == platform}
+        return next(iter(known.values())) if len(known) == 1 else None
+
+    def replace(task, job):
+        if task["anchor"] is not None:
+            task["anchor"]["href"] = job[2]
+        else:
+            replacements[task["href"]] = job[2]
+
+    priority = {"job_title": 0, "job_cta": 1, "card_link": 2, "unsupported_job_content": 3, "cross_platform_job": 3, "ambiguous_tracking": 4}
+    pending = []
     missing = False
-    subject_links = []
-    for a in soup.find_all("a", href=True):
-        subject_links.append((a.get("href", ""), a.get_text(" ", strip=True), a))
-    for raw in re.findall(r"https?://[^\s<>]+", text or ""):
-        subject_links.append((raw.rstrip(".,;)>"), "", None))
-    for href, label, anchor in subject_links:
-        pattern = url_pattern(href)
-        bump(counter, "url_patterns", pattern)
-        if pattern == "direct_or_embedded_job":
+    for key, items in groups.items():
+        unresolved = []
+        kinds = [classification(task) for task in items]
+        card_targets = {job[2]: job for task, kind in zip(items, kinds) if kind in {"job_title", "job_cta", "card_link"} and (job := known_in_card(task))}
+        shared_card_target = next(iter(card_targets.values())) if len(card_targets) == 1 else None
+        inherited_navigation = bool(set(kinds) & {"navigation", "marketing"}) and set(kinds) <= {"navigation", "marketing", "ambiguous_tracking", "other"}
+        for task, kind in zip(items, kinds):
+            if inherited_navigation and kind in {"ambiguous_tracking", "other"}:
+                kind = "navigation"
+            task["kind"] = kind
+            bump(counter, "link_decisions", kind)
+            if kind in {"canonical_job", "navigation", "marketing", "other"}:
+                continue
+            known = shared_card_target if kind in {"job_title", "job_cta", "card_link", "ambiguous_tracking"} and (task["anchor"] is None or known_in_card(task) == shared_card_target) else None
+            if known:
+                replace(task, known)
+                counter["canonical_card_reuse"] += 1
+            else:
+                unresolved.append(task)
+        if unresolved:
+            pending.append((min(priority[t["kind"]] for t in unresolved), key, unresolved))
+    # Strong cards first; original document order breaks ties deterministically.
+    for rank, key, items in sorted(pending, key=lambda row: row[0]):
+        # Another link in this card may have resolved since the first pass.
+        current_targets = {job[2]: job for task in items if (job := known_in_card(task))}
+        if len(current_targets) > 1:
+            missing = True
+            counter["unsupported_url_patterns"] += 1
+            counter["unresolved_job_targets"] += 1
+            bump(counter, "failure_reasons", "ambiguous_card_identity")
             continue
-        # Do not follow unsubscribe, account, bulk search or marketing navigation.
-        navigation = bool(NON_JOB.search(label) or re.search(r"unsubscribe|preferences|privacy", href, re.I))
-        suspicious = not navigation and ("tracker" in pattern or re.search(r"/jobs?/", href, re.I) or re.search(r"\b(?:view job|apply|scientist|technologist|fellow|researcher)\b", label, re.I))
-        if not suspicious:
-            continue
-        result, reason = resolver.resolve(href, platform) if resolver else (None, "redirect_unresolved")
+        known = next(iter(current_targets.values())) if current_targets else None
+        if known:
+            remaining_items = []
+            for task in items:
+                if task["anchor"] is None or known_in_card(task) == known:
+                    replace(task, known)
+                    counter["canonical_card_reuse"] += 1
+                else:
+                    remaining_items.append(task)
+            if not remaining_items:
+                continue
+            items = remaining_items
+        ambiguous = rank == priority["ambiguous_tracking"]
+        if ambiguous:
+            result, reason = None, "insufficient_job_evidence"
+            counter["ambiguous_targets"] += 1
+        elif resolver is None:
+            result, reason = None, "resolution_unavailable"
+        else:
+            requests_before, hits_before = resolver.requests, resolver.cache_hits
+            result, reason = resolver.resolve(key, platform)
+            counter["redirect_requests"] += resolver.requests - requests_before
+            counter["redirect_cache_hits"] += resolver.cache_hits - hits_before
         if result:
-            if anchor is not None:
-                anchor["href"] = result[2]
-            replacements[href] = result[2]
+            for task in items:
+                replace(task, result)
         else:
             missing = True
             counter["unsupported_url_patterns"] += 1
+            counter["unresolved_job_targets"] += int(not ambiguous)
             bump(counter, "failure_reasons", reason)
-    for raw, clean in replacements.items():
+    for raw, clean in sorted(replacements.items(), key=lambda item: -len(item[0])):
         text = text.replace(raw, clean)
     return str(soup), text, missing
 
 
 def _card(anchor):
-    """Never borrow a heading or food context from another job in a digest."""
-    chosen = anchor
-    own = identify_job_url(anchor.get("href", ""))
-    for parent in list(anchor.parents)[:6]:
-        if parent.name in {"body", "html", "[document]"}:
-            break
-        ids = {item[:2] for a in parent.find_all("a", href=True)
-               if (item := identify_job_url(a.get("href", "")))}
-        if ids - {own[:2]}:
-            break
-        if any(a is not anchor and not identify_job_url(a.get("href", ""))
-               and "tracker" in url_pattern(a.get("href", ""))
-               and not NON_JOB.search(a.get_text(" ", strip=True))
-               for a in parent.find_all("a", href=True)):
-            break
-        if len(parent.get_text(" ", strip=True)) > 900:
-            break
-        chosen = parent
-    return chosen
+    return job_card(anchor)
 
 
 def _valid_title(value: str) -> bool:
@@ -387,12 +582,12 @@ def _parse_email(subject, sender, html, text, counters, resolver=None):
         counter["unknown_coverage"] += 1
         counter["non_job_emails"] += 1
         return [], True
+    decisions_before = dict(counter["link_decisions"])
     recognized = _is_job_alert(subject, sender)
     counter["alerts_recognized"] += int(recognized)
     try:
         # Do not issue tracking requests merely because a sender is a job board.
-        evidence = recognized or bool(re.search(r"view job|job alert|scientist|technologist|research fellow|postdoctoral", _soup(html).get_text(" ", strip=True) + " " + text, re.I))
-        html, text, unresolved = prepare_links(html, text, platform, resolver if evidence else None, counter)
+        html, text, unresolved = prepare_links(html, text, platform, resolver, counter)
         html_jobs = extract_jobs_from_html(html)
         text_jobs = extract_jobs_from_text(text)
         by_id = {(job.source, job.source_id): job for job in text_jobs + html_jobs}
@@ -401,12 +596,11 @@ def _parse_email(subject, sender, html, text, counters, resolver=None):
         supported = {r[1] for h in hrefs if (r := identify_job_url(h)) and r[0] == platform}
         missing_title = supported - {j.source_id for j in jobs}
         # Unsupported trackers alone do not prove marketing is a job alert.
-        recognized = recognized or bool(supported) or bool(re.search(r"\b(?:view job|apply now|job alert)\b", _soup(html).get_text(" ", strip=True) + " " + text, re.I))
+        recognized = recognized or bool(supported) or any(counter["link_decisions"].get(k, 0) > decisions_before.get(k, 0) for k in ("job_title", "job_cta", "unsupported_job_content", "cross_platform_job"))
         if recognized and not _is_job_alert(subject, sender):
             counter["alerts_recognized"] += 1
         counter["links_extracted"] += len(jobs)
-        clear_non_job = bool(re.search(r"newsletter|recommended reading|career advice|job.search tips|security alert|password|invitation|connection request", subject, re.I))
-        uncertain = not recognized and unresolved and not clear_non_job
+        uncertain = not recognized and unresolved
         incomplete = (recognized and (not jobs or unresolved or bool(missing_title))) or uncertain
         if uncertain:
             bump(counter, "failure_reasons", "uncertain_message")
