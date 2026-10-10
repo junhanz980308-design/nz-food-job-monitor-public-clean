@@ -44,3 +44,38 @@ python -m scripts.backfill_alerts --since YYYY-MM-DD --until YYYY-MM-DD --apply
 ```
 
 The local command alone does not load or publish encrypted branch state; the manual workflow wraps it with the existing encrypted load/save steps. Never upload plaintext state or paste diagnostic input into public issues.
+
+## Follow-up: card-aware redirect selection
+
+A successful job extraction and a failed tracking link are not necessarily two different jobs. Earlier selection attempted nearly every tracker, including redundant card buttons and MIME duplicates; its failure counters counted link occurrences rather than necessarily distinct jobs. The old `redirect_unresolved` label meant no resolver was used (insufficient email-level evidence), not a failed network request and not proof that the link represented a job.
+
+The parser now inspects all links in each message before issuing requests. Explicit navigation/marketing controls are separated from job-title links, job CTAs, contextual card links and ambiguous tracking targets. Semantic cards, title boundaries, multiple job IDs, nested cards and linked sibling rows/blocks prevent one job from satisfying a neighbor. When a card has one canonical job identity, its duplicate title/button destinations can reuse it; after a successful redirect the other links in that same card can reuse that result. Exact normalized targets across HTML/plain-text alternatives share work, as do shared intermediate redirect hops. Only fragments are removed from request identities; signed query parameters are preserved.
+
+Resolution order within each message is job titles, job CTAs, contextual card links, then unsupported job-shaped links. Ambiguous trackers receive no speculative request and remain unresolved. A marketing-looking subject does not authorize acknowledging an email with unexplained opaque links. MIME duplicates of an explicitly identified navigation link inherit its navigation classification only when there is no conflicting job evidence. The scanner still reads messages in transport order; this is not global prioritization across the entire mailbox.
+
+No budget or network allowlist is expanded: 24 HEAD requests per scan, four hops, a 45-second start deadline and four-second request timeout remain. No GET fallback, job-page fetch, external tracker request, login or access-control bypass is added. HTTPS/userinfo/port/domain/DNS checks are retained. Navigation path recognition uses explicit path boundaries so opaque signature substrings are not mistaken for navigation.
+
+### Reading the new counters
+
+| Counter/category | Meaning |
+| --- | --- |
+| `link_occurrences`, `unique_link_targets`, `duplicate_links` | Raw HTML/text occurrences versus normalized distinct targets; none of these is a job count |
+| `link_decisions` | Fixed labels: canonical job, job title, job CTA, card link, navigation, marketing, ambiguous tracking, unsupported job content, cross-platform job or other |
+| `canonical_card_reuse` | Redundant card/MIME links covered by one known job without a request |
+| `redirect_requests`, `redirect_cache_hits` | Actual HEAD requests versus reused resolver results |
+| `unresolved_job_targets`, `ambiguous_targets` | Distinct selected job-evidence targets versus opaque targets without enough evidence; these are still not a count of missing jobs |
+| `insufficient_job_evidence`, `resolution_unavailable` | No speculative request or no resolver available; distinct from network rejection |
+| `reject_non_https`, `reject_userinfo`, `reject_port`, `reject_malformed_url` | URL syntax/transport restriction |
+| `reject_external_domain`, `reject_cross_platform` | Destination outside the allowed sender platform |
+| `reject_navigation_path`, `reject_unsupported_path` | Known navigation endpoint or path outside supported tracking/job patterns |
+| `reject_nonpublic_dns`, `redirect_dns_failed` | Non-public/missing DNS result or failed lookup |
+| `redirect_access_denied`, `redirect_rate_limited`, `redirect_head_unsupported` | HTTP 401/403, 429 or 405; no bypass/fallback is attempted |
+| `redirect_missing_location`, `redirect_not_http`, `redirect_server_error` | Redirect without Location, non-redirect response or server failure |
+| `redirect_request_budget`, `redirect_time_budget`, `redirect_hop_limit`, `redirect_loop` | Separate resource/loop limits |
+| `redirect_request_failed`, `missing_title` | Request failure without exception text, or a supported job with no safe title |
+
+Reasons for unresolved targets are counted once per normalized target per message, while classification decisions count occurrences. Repeated messages may still count the same target separately, with a resolver cache hit and no new request. Reasons never contain dynamic hosts, URLs, HTTP response bodies, subjects or addresses.
+
+Synthetic regression tests contrast forty explicit marketing/navigation links (zero jobs, zero redirect requests) with forty opaque unexplained targets (still deferred, no assertion that they are jobs). They also cover canonical reuse, mixed MIME, prioritization, neighbor isolation, shared redirect hops and failure categories. These demonstrate the policy; they do not identify the actual targets in any private email. Confirm the remaining real-template issues with a separately approved, read-only diagnostic backfill. Do not use apply=true or resume scheduled monitoring as part of this review.
+
+This follow-up does not modify acknowledgements/retry storage logic, encryption, MONITOR_STATE_KEY, state history, Telegram, Adzuna or workflow schedules.
