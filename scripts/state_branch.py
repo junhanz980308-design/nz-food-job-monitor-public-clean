@@ -31,7 +31,7 @@ def cipher():
 
 def validate(content: str) -> dict:
     data = json.loads(content)
-    allowed = {"version", "records", "aliases", "initialized_sources", "health", "mail_seen", "mail_scan_after"}
+    allowed = {"version", "records", "aliases", "initialized_sources", "health", "mail_seen", "mail_scan_after", "mail_retry"}
     if not isinstance(data, dict) or set(data) - allowed:
         raise RuntimeError("Unexpected state fields")
     if not isinstance(data.get("records"), dict) or not isinstance(data.get("aliases"), dict):

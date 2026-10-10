@@ -1,0 +1,75 @@
+name: Silent email alert backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Inclusive UTC day YYYY-MM-DD; use short windows (max 7 days)"
+        required: true
+        type: string
+      until:
+        description: "Exclusive UTC day YYYY-MM-DD, in the past"
+        required: true
+        type: string
+      apply:
+        description: "Save corrected acknowledgements and silent baseline; never sends Telegram"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+concurrency:
+  group: nz-food-job-monitor
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Load encrypted state
+        id: history
+        env:
+          MONITOR_STATE_KEY: ${{ secrets.MONITOR_STATE_KEY }}
+        run: python -m scripts.state_branch load
+      - name: Reprocess a bounded email window without notifications
+        id: scan
+        env:
+          GMAIL_OAUTH_TOKEN_JSON: ${{ secrets.GMAIL_OAUTH_TOKEN_JSON }}
+          GMAIL_IMAP_USER: ${{ secrets.GMAIL_IMAP_USER }}
+          GMAIL_IMAP_APP_PASSWORD: ${{ secrets.GMAIL_IMAP_APP_PASSWORD }}
+          BACKFILL_SINCE: ${{ inputs.since }}
+          BACKFILL_UNTIL: ${{ inputs.until }}
+          BACKFILL_APPLY: ${{ inputs.apply }}
+        shell: bash
+        run: |
+          EXTRA=()
+          if [[ "$BACKFILL_APPLY" == "true" ]]; then EXTRA+=(--apply); fi
+          python -m scripts.backfill_alerts --since "$BACKFILL_SINCE" --until "$BACKFILL_UNTIL" "${EXTRA[@]}"
+      - name: Persist encrypted backfill state
+        id: persist
+        if: ${{ always() && inputs.apply && steps.history.outcome == 'success' && steps.scan.outcome != 'skipped' }}
+        env:
+          MONITOR_STATE_KEY: ${{ secrets.MONITOR_STATE_KEY }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python -m scripts.state_branch save
+      - name: Retain encrypted recovery only
+        if: ${{ failure() && steps.persist.outcome == 'failure' && hashFiles('state/seen.enc') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-backfill-recovery-${{ github.run_id }}
+          path: state/seen.enc
+          retention-days: 7
+      - name: Remove plaintext runtime files
+        if: ${{ always() }}
+        run: rm -f state/seen.json state/seen.tmp .state-parent
