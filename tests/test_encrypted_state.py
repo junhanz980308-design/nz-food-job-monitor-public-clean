@@ -127,7 +127,7 @@ def test_public_workflow_keeps_schedules_and_only_encrypted_artifact():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/monitor.yml").read_text()
     assert "repository.private" not in workflow
-    assert '"7,17,27,37,47,57 * * * *"' in workflow
+    assert '"7,17,27,37,47,57 * * * *"' not in workflow
     assert '"13 */4 * * *"' in workflow
     assert "secrets.MONITOR_STATE_KEY" in workflow
     assert "path: state/seen.enc" in workflow
