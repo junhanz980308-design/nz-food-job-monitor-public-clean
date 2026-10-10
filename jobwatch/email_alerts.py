@@ -14,7 +14,12 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from email.utils import parseaddr
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urljoin
+from html import unescape
+import ipaddress
+import socket
+import time
+import requests
 
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 
@@ -39,11 +44,17 @@ def trusted_host(host: str) -> bool:
 
 
 def unwrap_target(href: str) -> str:
-    url = href or ""
+    url = unescape(href or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
     for _ in range(3):
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
-        target = next((params[k][0] for k in ("url", "target", "redirect", "redirect_url", "dest", "destination", "u") if params.get(k)), "")
+        target = next((params[k][0] for k in ("url", "target", "redirect", "redirect_url", "dest", "destination", "u", "redirectUrl", "continue", "q") if params.get(k)), "")
+        for _ in range(2):
+            if target.startswith(("http://", "https://")):
+                break
+            target = unquote(target)
         if target.startswith(("http://", "https://")):
             url = target
             continue
@@ -69,7 +80,9 @@ def platform_for_host(host: str) -> str:
 
 def new_mail_counters() -> dict:
     return {name: dict(emails_checked=0, alerts_recognized=0, links_extracted=0,
-                       parse_failures=0, unknown_coverage=0, coverage="not_checked")
+                       parse_failures=0, unknown_coverage=0, coverage="not_checked",
+                       non_job_emails=0, emails_acknowledged=0, emails_deferred=0,
+                       unsupported_url_patterns=0, failure_reasons={}, url_patterns={})
             for name in (*PLATFORM_DOMAINS, "Unknown")}
 
 
@@ -93,6 +106,9 @@ def identify_job_url(href: str) -> tuple[str, str, str] | None:
         match = re.fullmatch(r"/(?:comm/)?jobs/view/(?:[^/]*-)?(\d+)/?", path)
         if match:
             ident = match.group(1)
+        elif path.rstrip("/") in {"/jobs/view", "/comm/jobs/view", "/jobs/search", "/comm/jobs/search"}:
+            ident = parse_qs(parsed.query).get("currentJobId", parse_qs(parsed.query).get("jobId", [""]))[0]
+        if re.fullmatch(r"\d+", ident):
             return platform, ident, f"https://www.linkedin.com/jobs/view/{ident}"
     elif platform == "SEEK":
         match = re.fullmatch(r"/job/(\d+)/?", path)
@@ -100,7 +116,7 @@ def identify_job_url(href: str) -> tuple[str, str, str] | None:
             ident = match.group(1)
     elif platform == "Indeed":
         ident = parse_qs(parsed.query).get("jk", [""])[0]
-        if not re.fullmatch(r"[\w-]+", ident) or path.rstrip("/") not in {"/viewjob", "/m/viewjob", "/rc/clk", "/pagead/clk"}:
+        if not re.fullmatch(r"[\w-]+", ident) or path.rstrip("/") not in {"/viewjob", "/m/viewjob", "/rc/clk", "/pagead/clk", "/clk", "/company/clk"}:
             ident = ""
     elif platform == "Trade Me" and "/jobs/" in path:
         match = re.search(r"/(?:listing/(\d+)/?|auction-(\d+)\.htm)$", path)
@@ -112,10 +128,133 @@ def identify_job_url(href: str) -> tuple[str, str, str] | None:
             ident = match.group(1)
     if not ident:
         return None
+    if platform == "Indeed":
+        return platform, ident, f"https://nz.indeed.com/viewjob?jk={ident}"
     clean = canonical_url(url)
     if platform in {"Trade Me", "Adzuna"}:
         clean = clean.split("?", 1)[0]
     return platform, ident, clean
+
+
+TRACK_PATH = re.compile(r"^/(?:ls/click|ss/c|uni/ss/c|click|clicks|track|tracking|redirect|go|rc/clk|pagead/clk|clk)(?:/|$)", re.I)
+NON_JOB = re.compile(r"unsubscribe|preferences|privacy|help|settings|login|sign.?in|manage.alert|view.all|see.all|search.jobs|browse.jobs", re.I)
+
+
+def bump(counter, field, label):
+    values = counter[field]
+    values[label] = values.get(label, 0) + 1
+
+
+def url_pattern(href):
+    try:
+        parsed = urlparse(unwrap_target(href))
+        if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or parsed.port not in (None, 443):
+            return "unsafe_url"
+        if identify_job_url(href):
+            return "direct_or_embedded_job"
+        if TRACK_PATH.match(parsed.path):
+            return "opaque_first_party_tracker" if trusted_host(parsed.hostname or "") else "opaque_external_tracker"
+        if NON_JOB.search(parsed.path):
+            return "navigation"
+        return "unsupported_first_party" if trusted_host(parsed.hostname or "") else "external_link"
+    except (ValueError, TypeError):
+        return "unsafe_url"
+
+
+class RedirectResolver:
+    """HEAD-only, first-party tracker resolution; never request a job page/body.
+
+    External email vendors, HTML/JS redirects, login flows and GET-only endpoints
+    remain unsupported. A scan-wide request/time budget prevents email amplification.
+    """
+    def __init__(self):
+        self.cache = {}
+        self.remaining = 24
+        self.deadline = time.monotonic() + 45
+
+    def resolve(self, href, platform):
+        key = (href, platform)
+        if key in self.cache:
+            return self.cache[key]
+        current = unwrap_target(href)
+        visited = set()
+        result, reason = None, "redirect_limit"
+        for _ in range(4):
+            if urlparse(current).scheme != "https":
+                reason = "redirect_not_allowed"
+                break
+            job = identify_job_url(current)
+            if job:
+                result, reason = (job, "resolved") if job[0] == platform else (None, "platform_mismatch")
+                break
+            try:
+                parsed = urlparse(current)
+                if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443)
+                        or platform_for_host(parsed.hostname or "") != platform or not TRACK_PATH.match(parsed.path)):
+                    reason = "redirect_not_allowed"
+                    break
+                if current in visited:
+                    reason = "redirect_loop"
+                    break
+                if self.remaining <= 0 or time.monotonic() >= self.deadline:
+                    reason = "redirect_budget"
+                    break
+                visited.add(current)
+                self.remaining -= 1
+                addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+                if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+                    reason = "redirect_not_allowed"
+                    break
+                # No browser cookies, proxy environment, authorization or Gmail headers.
+                with requests.Session() as session:
+                    session.trust_env = False
+                    response = session.head(current, allow_redirects=False, timeout=4)
+                    try:
+                        location = response.headers.get("Location", "")
+                        if response.status_code not in {301, 302, 303, 307, 308} or not location:
+                            reason = "redirect_not_http"
+                            break
+                        current = urljoin(current, location)
+                    finally:
+                        response.close()
+            except Exception:
+                reason = "redirect_request_failed"
+                break
+        self.cache[key] = (result, reason)
+        return self.cache[key]
+
+
+def prepare_links(html, text, platform, resolver, counter):
+    soup = _soup(html)
+    replacements = {}
+    missing = False
+    subject_links = []
+    for a in soup.find_all("a", href=True):
+        subject_links.append((a.get("href", ""), a.get_text(" ", strip=True), a))
+    for raw in re.findall(r"https?://[^\s<>]+", text or ""):
+        subject_links.append((raw.rstrip(".,;)>"), "", None))
+    for href, label, anchor in subject_links:
+        pattern = url_pattern(href)
+        bump(counter, "url_patterns", pattern)
+        if pattern == "direct_or_embedded_job":
+            continue
+        # Do not follow unsubscribe, account, bulk search or marketing navigation.
+        navigation = bool(NON_JOB.search(label) or re.search(r"unsubscribe|preferences|privacy", href, re.I))
+        suspicious = not navigation and ("tracker" in pattern or re.search(r"/jobs?/", href, re.I) or re.search(r"\b(?:view job|apply|scientist|technologist|fellow|researcher)\b", label, re.I))
+        if not suspicious:
+            continue
+        result, reason = resolver.resolve(href, platform) if resolver else (None, "redirect_unresolved")
+        if result:
+            if anchor is not None:
+                anchor["href"] = result[2]
+            replacements[href] = result[2]
+        else:
+            missing = True
+            counter["unsupported_url_patterns"] += 1
+            bump(counter, "failure_reasons", reason)
+    for raw, clean in replacements.items():
+        text = text.replace(raw, clean)
+    return str(soup), text, missing
 
 
 def _card(anchor):
@@ -128,6 +267,11 @@ def _card(anchor):
         ids = {item[:2] for a in parent.find_all("a", href=True)
                if (item := identify_job_url(a.get("href", "")))}
         if ids - {own[:2]}:
+            break
+        if any(a is not anchor and not identify_job_url(a.get("href", ""))
+               and "tracker" in url_pattern(a.get("href", ""))
+               and not NON_JOB.search(a.get_text(" ", strip=True))
+               for a in parent.find_all("a", href=True)):
             break
         if len(parent.get_text(" ", strip=True)) > 900:
             break
@@ -142,8 +286,14 @@ def _valid_title(value: str) -> bool:
 def _best_title(anchor) -> tuple[str, str]:
     value = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))
     if not _valid_title(value):
+        value = anchor.get("aria-label", "") or anchor.get("title", "")
+        if not value and anchor.find("img"):
+            value = anchor.find("img").get("alt", "")
+    if not _valid_title(value):
         card = _card(anchor)
         choices = card.find_all(["h1", "h2", "h3", "h4", "a"])
+        # Titles in table-based email cards commonly use styled spans/strong text.
+        choices += card.select("[class*=title], [class*=Title], strong, b")
         value = next((v for node in choices if _valid_title(v := node.get_text(" ", strip=True))), "")
     company = ""
     pattern = re.match(r"^(.*?)\s+at\s+(.{3,100})$", value, re.I)
@@ -222,53 +372,82 @@ def _extract_gmail_parts(payload: dict) -> tuple[str, str]:
 
 
 def _is_job_alert(subject: str, sender: str) -> bool:
-    low = subject.lower()
     address = parseaddr(sender)[1]
     allowed = "@" in address and trusted_host(address.rsplit("@", 1)[1].lower())
-    return allowed and bool(re.search(r"\b(job|jobs|career|vacanc|opportunit|role|recommended|match)\w*\b", low))
+    # "Recommended reading" / "career advice" are not job alerts.
+    return allowed and bool(re.search(r"\b(?:jobs?|job alerts?|new roles|new vacancies|recommended jobs|job matches)\b", subject, re.I)) and not bool(re.search(r"career advice|job.search tips|webinar|newsletter", subject, re.I))
 
 
-def _email_to_jobs(subject: str, sender: str, html: str, text: str, counters: dict | None = None) -> list[Job]:
+def _parse_email(subject, sender, html, text, counters, resolver=None):
     address = parseaddr(sender)[1]
     platform = platform_for_host(address.rsplit("@", 1)[1].lower()) if "@" in address else "Unknown"
-    counter = counters[platform] if counters is not None else None
-    if counter is not None:
-        counter["emails_checked"] += 1
+    counter = counters[platform]
+    counter["emails_checked"] += 1
     if platform == "Unknown":
-        if counter is not None:
-            counter["unknown_coverage"] += 1
-        return []
-    subject_alert = _is_job_alert(subject, sender)
-    if counter is not None:
-        counter["alerts_recognized"] += int(subject_alert)
-    # Strict sender check remains. Merge both MIME alternatives: a partially
-    # parsed HTML digest must not hide a valid plaintext job.
+        counter["unknown_coverage"] += 1
+        counter["non_job_emails"] += 1
+        return [], True
+    recognized = _is_job_alert(subject, sender)
+    counter["alerts_recognized"] += int(recognized)
     try:
+        # Do not issue tracking requests merely because a sender is a job board.
+        evidence = recognized or bool(re.search(r"view job|job alert|scientist|technologist|research fellow|postdoctoral", _soup(html).get_text(" ", strip=True) + " " + text, re.I))
+        html, text, unresolved = prepare_links(html, text, platform, resolver if evidence else None, counter)
         html_jobs = extract_jobs_from_html(html)
         text_jobs = extract_jobs_from_text(text)
         by_id = {(job.source, job.source_id): job for job in text_jobs + html_jobs}
-        jobs = [job for job in by_id.values() if job.source == f"{platform} email alert"]
-        recognized = subject_alert or bool(jobs)
-        if counter is not None:
-            counter["alerts_recognized"] += int(bool(jobs) and not subject_alert)
-            counter["links_extracted"] += len(jobs)
-            counter["parse_failures"] += int(recognized and not jobs)
-            # Even a successful parse doesn't prove complete template coverage.
-            hrefs = [a.get("href", "") for a in _soup(html).find_all("a", href=True)]
-            unsupported = any(not identify_job_url(h) and re.search(r"job|click|redirect", h, re.I) for h in hrefs)
-            supported_ids = {r[:2] for h in hrefs if (r := identify_job_url(h))}
-            missing_titles = len(supported_ids) > len(jobs)
-            counter["unknown_coverage"] += int(not jobs or unsupported or missing_titles)
-        return jobs if recognized else []
-    except Exception:
-        # Never emit an exception containing an email fragment or private URL.
-        if counter is not None:
+        jobs = [j for j in by_id.values() if j.source == f"{platform} email alert"]
+        hrefs = [a.get("href", "") for a in _soup(html).find_all("a", href=True)] + re.findall(r"https?://[^\s<>]+", text)
+        supported = {r[1] for h in hrefs if (r := identify_job_url(h)) and r[0] == platform}
+        missing_title = supported - {j.source_id for j in jobs}
+        # Unsupported trackers alone do not prove marketing is a job alert.
+        recognized = recognized or bool(supported) or bool(re.search(r"\b(?:view job|apply now|job alert)\b", _soup(html).get_text(" ", strip=True) + " " + text, re.I))
+        if recognized and not _is_job_alert(subject, sender):
+            counter["alerts_recognized"] += 1
+        counter["links_extracted"] += len(jobs)
+        clear_non_job = bool(re.search(r"newsletter|recommended reading|career advice|job.search tips|security alert|password|invitation|connection request", subject, re.I))
+        uncertain = not recognized and unresolved and not clear_non_job
+        incomplete = (recognized and (not jobs or unresolved or bool(missing_title))) or uncertain
+        if uncertain:
+            bump(counter, "failure_reasons", "uncertain_message")
+        if incomplete:
             counter["parse_failures"] += 1
             counter["unknown_coverage"] += 1
+            if not jobs:
+                bump(counter, "failure_reasons", "no_extractable_jobs")
+            if missing_title:
+                bump(counter, "failure_reasons", "missing_title")
+        elif not recognized:
+            counter["non_job_emails"] += 1
+            counter["unknown_coverage"] += 1
+        return jobs, not incomplete
+    except Exception:
+        counter["parse_failures"] += 1
+        counter["unknown_coverage"] += 1
+        bump(counter, "failure_reasons", "parser_exception")
         raise SourceError("Email parsing failed") from None
 
 
-def _gmail_api_messages(seen: set[str], after: datetime | None = None, counters: dict | None = None) -> tuple[list[Job], list[str], int]:
+def _email_to_jobs(subject, sender, html, text, counters=None):
+    return _parse_email(subject, sender, html, text, counters or new_mail_counters())[0]
+
+
+def read_message(subject, sender, html, text, counters, resolver, hashed, retry):
+    address = parseaddr(sender)[1]
+    platform = platform_for_host(address.rsplit("@", 1)[1].lower()) if "@" in address else "Unknown"
+    try:
+        jobs, acknowledge = _parse_email(subject, sender, html, text, counters, resolver)
+    except SourceError:
+        jobs, acknowledge = [], False
+    counters[platform]["emails_acknowledged" if acknowledge else "emails_deferred"] += 1
+    if acknowledge:
+        retry.discard(hashed)
+    else:
+        retry.add(hashed)
+    return jobs, acknowledge
+
+
+def _gmail_api_messages(seen: set[str], after: datetime | None = None, counters: dict | None = None, retry: set | None = None, before: datetime | None = None) -> tuple[list[Job], list[str], int]:
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
     token = json.loads(os.environ["GMAIL_OAUTH_TOKEN_JSON"])
@@ -276,6 +455,9 @@ def _gmail_api_messages(seen: set[str], after: datetime | None = None, counters:
     if not credentials.refresh_token:
         raise SourceError("Gmail OAuth credentials have no refresh token; re-authorize offline access")
     service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    counters = counters if counters is not None else new_mail_counters()
+    retry = retry if retry is not None else set()
+    resolver = RedirectResolver()
     jobs: list[Job] = []
     new_ids: list[str] = []
     examined = 0
@@ -283,6 +465,8 @@ def _gmail_api_messages(seen: set[str], after: datetime | None = None, counters:
     while True:
         domains = ["linkedin.com", "seek.com", "seek.co.nz", "seek.com.au", "indeed.com", "trademe.co.nz", "adzuna.co.nz"]
         since = f"after:{int(after.timestamp())}" if after else "newer_than:4d"
+        if before:
+            since += f" before:{int(before.timestamp())}"
         query = since + " {" + " ".join("from:" + d for d in domains) + "}"
         payload = service.users().messages().list(
             userId="me", q=query, maxResults=100, pageToken=next_page,
@@ -297,8 +481,10 @@ def _gmail_api_messages(seen: set[str], after: datetime | None = None, counters:
             headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
             sender, subject = headers.get("from", ""), headers.get("subject", "")
             html, txt = _extract_gmail_parts(msg.get("payload", {}))
-            jobs.extend(_email_to_jobs(subject, sender, html, txt, counters))
-            new_ids.append(hashed)
+            extracted, ack = read_message(subject, sender, html, txt, counters, resolver, hashed, retry)
+            jobs.extend(extracted)
+            if ack:
+                new_ids.append(hashed)
             examined += 1
             if examined > 500:
                 raise SourceError("Mail scan limit exceeded; narrow the dedicated alert mailbox before initializing")
@@ -310,8 +496,11 @@ def _gmail_api_messages(seen: set[str], after: datetime | None = None, counters:
     return jobs, new_ids, examined
 
 
-def _imap_messages(seen: set[str], after: datetime | None = None, counters: dict | None = None) -> tuple[list[Job], list[str], int]:
+def _imap_messages(seen: set[str], after: datetime | None = None, counters: dict | None = None, retry: set | None = None, before: datetime | None = None) -> tuple[list[Job], list[str], int]:
     username, password = os.environ["GMAIL_IMAP_USER"], os.environ["GMAIL_IMAP_APP_PASSWORD"]
+    counters = counters if counters is not None else new_mail_counters()
+    retry = retry if retry is not None else set()
+    resolver = RedirectResolver()
     jobs: list[Job] = []
     new_ids: list[str] = []
     examined = 0
@@ -327,7 +516,10 @@ def _imap_messages(seen: set[str], after: datetime | None = None, counters: dict
         start = (after or datetime.now(timezone.utc) - timedelta(days=4)).strftime("%d-%b-%Y")
         uid_set: set[bytes] = set()
         for sender_domain in TRUSTED:
-            typ, data = connection.uid("search", None, "SINCE", start, "FROM", f'"{sender_domain}"')
+            terms = ["SINCE", start, "FROM", f'"{sender_domain}"']
+            if before:
+                terms += ["BEFORE", before.strftime("%d-%b-%Y")]
+            typ, data = connection.uid("search", None, *terms)
             if typ != "OK":
                 raise SourceError("IMAP search failed")
             uid_set.update((data[0] or b"").split())
@@ -355,23 +547,27 @@ def _imap_messages(seen: set[str], after: datetime | None = None, counters: dict
                     continue
                 body = part.get_content()
                 (html_parts if part.get_content_type() == "text/html" else text_parts).append(body)
-            jobs.extend(_email_to_jobs(subject, sender, "\n".join(html_parts), "\n".join(text_parts), counters))
-            new_ids.append(hashed)
+            extracted, ack = read_message(subject, sender, "\n".join(html_parts), "\n".join(text_parts), counters, resolver, hashed, retry)
+            jobs.extend(extracted)
+            if ack:
+                new_ids.append(hashed)
             examined += 1
     return jobs, new_ids, examined
 
 
 def gmail_alerts(state: dict) -> tuple[SourceResult, list[str]]:
     sid = "gmail-alerts"
-    seen = set(state.get("mail_seen", []))
+    retry = set(state.get("mail_retry", []))
+    seen = set(state.get("mail_seen", [])) - retry
+    before = datetime.fromisoformat(state["mail_scan_before"]) if state.get("mail_scan_before") else None
     after = datetime.fromisoformat(state["mail_scan_after"]) if state.get("mail_scan_after") else None
     counters = new_mail_counters()
     try:
         if os.getenv("GMAIL_OAUTH_TOKEN_JSON"):
-            jobs, new_ids, count = _gmail_api_messages(seen, after, counters)
+            jobs, new_ids, count = _gmail_api_messages(seen, after, counters, retry, before)
             method = "Gmail OAuth API"
         elif os.getenv("GMAIL_IMAP_USER") and os.getenv("GMAIL_IMAP_APP_PASSWORD"):
-            jobs, new_ids, count = _imap_messages(seen, after, counters)
+            jobs, new_ids, count = _imap_messages(seen, after, counters, retry, before)
             method = "Gmail IMAP app password"
         else:
             return SourceResult(sid, [], "PENDING", "Configure OAuth or IMAP App Password", counters), []
@@ -379,7 +575,9 @@ def gmail_alerts(state: dict) -> tuple[SourceResult, list[str]]:
         for counter in counters.values():
             counter["coverage"] = "scan_failed"
         raise MailScanError(counters) from None
+    state["mail_retry"] = sorted(retry)
     for counter in counters.values():
         counter["coverage"] = ("no_emails_checked" if not counter["emails_checked"] else
                                "unknown_or_partial" if counter["unknown_coverage"] else "parsed")
-    return SourceResult(sid, jobs, "ALERT_ONLY", f"{method}: {count} messages checked; {len(jobs)} job links extracted", counters), new_ids
+    partial = bool(retry) or any(c["parse_failures"] for c in counters.values())
+    return SourceResult(sid, jobs, "PARTIAL" if partial else "ALERT_ONLY", f"{method}: {count} messages checked; {len(jobs)} job links extracted", counters), new_ids

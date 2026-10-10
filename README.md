@@ -74,3 +74,7 @@ Standard GitHub-hosted runners are free for public repositories; other runner ty
 ## Publishing this code
 
 See [PUBLIC_UPLOAD.md](PUBLIC_UPLOAD.md) for an upload checklist. No repository has been created or published as part of preparing this folder. Keep existing private repositories, their secrets and their `monitor-state` branches unchanged.
+
+## Email parsing failures and historical recovery
+
+See [Email repair and controlled backfill](docs/EMAIL_REPAIR.md). Failed/partial alerts now remain retryable and fail visibly. A manual-only, silent backfill can recover previously acknowledged messages without clearing history or replaying old Telegram notifications. Production execution requires separate approval.

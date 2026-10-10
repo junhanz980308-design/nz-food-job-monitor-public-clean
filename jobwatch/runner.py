@@ -25,7 +25,7 @@ def process_results(
     state: State, result: SourceResult, candidates: dict[str, tuple[Job, object]],
     *, dry_run: bool, audit: Audit | None = None,
 ) -> None:
-    if result.status not in ("LIVE", "ALERT_ONLY"):
+    if result.status not in ("LIVE", "ALERT_ONLY", "PARTIAL"):
         return
     previously_initialized = state.initialized(result.source_id)
     audit = audit if audit is not None else Audit(state)
@@ -59,8 +59,10 @@ def process_results(
             if not old or preferred or match.score > old[1].score:
                 candidates[canonical_id] = (job, match)
         audit.record(state, canonical_id, match, decision, baseline)
-    state.set_initialized(result.source_id)
-    state.health_ok(result.source_id)
+    if result.status != "PARTIAL" or result.jobs:
+        state.set_initialized(result.source_id)
+    if result.status != "PARTIAL":
+        state.health_ok(result.source_id)
 
 
 def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> int:
@@ -80,14 +82,14 @@ def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> 
         nonlocal active
         if result.counters:
             audit.mail = result.counters
-        if result.status in ("LIVE", "ALERT_ONLY"):
+        if result.status in ("LIVE", "ALERT_ONLY", "PARTIAL"):
             active += 1
             process_results(state, result, candidates, dry_run=dry_run, audit=audit)
             if message_hashes:
                 pending_mail_hashes.extend(message_hashes)
         else:
             LOG.warning("Source unavailable or not configured")
-        summaries.append("Source accepted" if result.status in ("LIVE", "ALERT_ONLY") else "Source unavailable")
+        summaries.append("Source accepted" if result.status in ("LIVE", "ALERT_ONLY", "PARTIAL") else "Source unavailable")
 
     def error(source_id: str, exception: Exception):
         if hasattr(exception, "counters"):
@@ -106,6 +108,7 @@ def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> 
 
     if mode in ("fast", "all"):
         try:
+            state.data.setdefault("mail_scan_after", (scan_start - timedelta(days=4)).isoformat())
             mail_state = state.data
             if dry_run:
                 mail_state = copy.deepcopy(state.data)
@@ -115,6 +118,8 @@ def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> 
                 mail_state["mail_scan_after"] = min(mail_state.get("mail_scan_after", lookback), lookback)
             emails, hashes = gmail_alerts(mail_state)
             accept(emails, hashes)
+            if emails.status == "PARTIAL":
+                error("gmail-alerts", SourceError("Partial extraction"))
             mail_success = emails.status == "ALERT_ONLY"
             if mail_success:
                 state.data.setdefault("mail_scan_after", (scan_start - timedelta(days=4)).isoformat())
@@ -162,7 +167,7 @@ def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> 
         # next scan reloads those messages; successful jobs remain deduplicated.
         if not failed:
             state.data["mail_seen"] = sorted(set(state.data.get("mail_seen", [])) | set(pending_mail_hashes))
-            if mail_success:
+            if mail_success and not state.data.get("mail_retry"):
                 state.data["mail_scan_after"] = (scan_start - timedelta(days=1)).isoformat()
         state.save()
     summary = (
@@ -174,6 +179,7 @@ def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> 
     for line in summaries:
         LOG.info("SOURCE COVERAGE: %s", line)
     report = audit.report()
+    report["pending_email_retries"] = len(state.data.get("mail_retry", []))
     aggregate = {key: value for key, value in report.items() if key != "items"}
     LOG.info("AUDIT_SUMMARY: %s", json.dumps(aggregate, sort_keys=True))
     if dry_run:
