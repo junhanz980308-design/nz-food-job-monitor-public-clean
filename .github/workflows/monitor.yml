@@ -2,9 +2,7 @@ name: NZ Food Job Monitor
 
 on:
   schedule:
-    # Fast sources every 10 minutes. Times are in UTC, not JST.
-    - cron: "7,17,27,37,47,57 * * * *"
-    # Adzuna 11 queries x 6 checks/day = 2,046 calls/31 days before retries/manual runs.
+    # Adzuna only. Gmail monitoring remains paused.
     - cron: "13 */4 * * *"
   workflow_dispatch:
     inputs:
