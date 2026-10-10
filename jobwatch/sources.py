@@ -14,10 +14,23 @@ from .models import Job, SourceResult, is_nz_location
 
 LOG = logging.getLogger(__name__)
 USER_AGENT = "NZFoodJobWatch/1.0 (personal job search; public feeds only)"
+ERROR_CATEGORIES = frozenset({
+    "http_400", "http_401", "http_403", "http_429", "http_5xx", "http_other",
+    "network_timeout", "dns_or_connection_error", "network_error",
+    "invalid_json", "unexpected_response", "unexpected_error",
+})
 
 
 class SourceError(Exception):
-    pass
+    def __init__(self, message: str, *, category: str = "unexpected_error"):
+        super().__init__(message)
+        self.category = category
+
+
+def source_error_category(error: Exception) -> str:
+    """Only fixed labels may reach logs; never inspect exception text or URLs."""
+    category = getattr(error, "category", None) if isinstance(error, SourceError) else None
+    return category if isinstance(category, str) and category in ERROR_CATEGORIES else "unexpected_error"
 
 
 def get_json(url: str, *, params: dict | None = None) -> dict | list:
@@ -28,13 +41,23 @@ def get_json(url: str, *, params: dict | None = None) -> dict | list:
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
             timeout=(8, 25),
         )
-        if response.status_code != 200:
-            raise SourceError(f"HTTP {response.status_code}")
+    except requests.exceptions.Timeout:
+        raise SourceError("Request timed out", category="network_timeout") from None
+    except requests.exceptions.ConnectionError:
+        raise SourceError("Connection failed", category="dns_or_connection_error") from None
+    except requests.exceptions.RequestException:
+        raise SourceError("Network request failed", category="network_error") from None
+    status = response.status_code
+    if status != 200:
+        category = (f"http_{status}" if status in {400, 401, 403, 429} else
+                    "http_5xx" if 500 <= status <= 599 else "http_other")
+        raise SourceError("HTTP request failed", category=category)
+    # Requests' JSONDecodeError is also a RequestException. Decode separately
+    # so a non-JSON success response cannot be mistaken for a network failure.
+    try:
         return response.json()
-    except requests.exceptions.RequestException as exc:
-        raise SourceError(f"Network error ({type(exc).__name__})") from None
     except ValueError:
-        raise SourceError("Endpoint did not return JSON") from None
+        raise SourceError("Endpoint did not return JSON", category="invalid_json") from None
 
 
 def text_only(value: str | None) -> str:
@@ -43,11 +66,28 @@ def text_only(value: str | None) -> str:
 
 def records(payload, key: str) -> list[dict]:
     if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
-        raise SourceError("Unexpected API response shape")
+        raise SourceError("Unexpected API response shape", category="unexpected_response")
     result = payload[key]
     if any(not isinstance(item, dict) for item in result):
-        raise SourceError("Unexpected job record shape")
+        raise SourceError("Unexpected job record shape", category="unexpected_response")
     return result
+
+
+def _adzuna_records(payload) -> list[dict]:
+    """Detect malformed consumed fields before they fail later in matching/state."""
+    items = records(payload, "results")
+    for item in items:
+        valid = all(item.get(key) is None or isinstance(item[key], str)
+                    for key in ("title", "description", "redirect_url", "created"))
+        for key in ("company", "location"):
+            value = item.get(key)
+            valid = valid and (value is None or isinstance(value, dict)
+                               and (value.get("display_name") is None or isinstance(value["display_name"], str)))
+        valid = valid and all(item.get(key) is None or type(item[key]) in (int, float)
+                              for key in ("salary_min", "salary_max"))
+        if not valid:
+            raise SourceError("Unexpected Adzuna job fields", category="unexpected_response")
+    return items
 
 
 def adzuna_search(query: str) -> SourceResult:
@@ -64,7 +104,7 @@ def adzuna_search(query: str) -> SourceResult:
         },
     )
     output: list[Job] = []
-    for item in records(payload, "results"):
+    for item in _adzuna_records(payload):
         title = text_only(item.get("title"))
         company = (item.get("company") or {}).get("display_name", "")
         loc = (item.get("location") or {}).get("display_name", "")

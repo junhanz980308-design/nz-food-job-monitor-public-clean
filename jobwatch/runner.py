@@ -15,7 +15,7 @@ from .matching import ALERT_TIERS, match_job
 from .audit import Audit
 from .models import Job, SourceResult
 from .notification import job_message, send_message
-from .sources import SourceError, adzuna_search, poll_ats, official_feed
+from .sources import SourceError, adzuna_search, poll_ats, official_feed, source_error_category
 from .state import State
 
 LOG = logging.getLogger("jobwatch")
@@ -91,13 +91,15 @@ def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> 
             LOG.warning("Source unavailable or not configured")
         summaries.append("Source accepted" if result.status in ("LIVE", "ALERT_ONLY", "PARTIAL") else "Source unavailable")
 
-    def error(source_id: str, exception: Exception):
+    def error(source_id: str, exception: Exception, *, adzuna_query_index: int | None = None):
         if hasattr(exception, "counters"):
             audit.mail = exception.counters
         msg = "Source failed"
+        if adzuna_query_index is not None:
+            msg = f"Adzuna source failed; query_index={adzuna_query_index}; category={source_error_category(exception)}"
         errors.append(msg)
         summaries.append(msg)
-        LOG.error("Source failed; details omitted for privacy")
+        LOG.error("%s; details omitted for privacy", msg)
         if state.health_failed(source_id):
             try:
                 if not dry_run:
@@ -139,11 +141,11 @@ def run(config_path: str, state_path: str, mode: str, dry_run: bool = False) -> 
                 error(sid, exc)
 
     if mode in ("broad", "all"):
-        for query in config.get("adzuna_queries", []):
+        for query_index, query in enumerate(config.get("adzuna_queries", []), start=1):
             try:
                 accept(adzuna_search(query))
             except Exception as exc:
-                error(f"adzuna:{query}", exc)
+                error(f"adzuna:{query}", exc, adzuna_query_index=query_index)
 
     sent, failed = 0, 0
     candidates = {state.resolve(key): value for key, value in candidates.items()}

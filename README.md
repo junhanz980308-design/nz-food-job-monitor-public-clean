@@ -55,6 +55,27 @@ A real dry run still reads configured sources, but sends no Telegram messages an
 
 The audit reports fetched results, match categories, ambiguous cases, duplicates, baseline suppression and notification history using counts and rule identifiers. It does not print email bodies, private URLs or job identities. Existing history can be audited with `--dry-run` without rewriting it.
 
+### Safe Adzuna failure diagnostics
+
+Logs and the Actions summary identify each failed query by its **one-based position** in `config/sources.json`, for example `Adzuna source failed; query_index=4; category=http_429`. Query text and request/response details are omitted. Categories come from a fixed allowlist:
+
+| Category | Meaning |
+| --- | --- |
+| `http_400` | API rejected the request as bad input |
+| `http_401` | API reported an authentication failure |
+| `http_403` | API denied access; this alone does not establish why |
+| `http_429` | API explicitly reported rate limiting |
+| `http_5xx` | API/server-side HTTP failure |
+| `http_other` | Another non-200 HTTP status |
+| `network_timeout` | Connection or response timeout |
+| `dns_or_connection_error` | DNS, connection or TLS failure; exact subtype is not inferred from exception text |
+| `network_error` | Another request-layer failure |
+| `invalid_json` | HTTP 200 response could not be decoded as JSON |
+| `unexpected_response` | JSON decoded, but the result structure or consumed job fields had unexpected types |
+| `unexpected_error` | An unclassified failure; raw exception details remain hidden |
+
+Individual failures still leave other queries running and make the run exit unsuccessfully. These diagnostics add no retries or API requests, and do not change query configuration, scoring, notifications or saved history. Existing aggregate-only logs cannot establish which category caused an earlier failure; a separately authorized future run is needed to observe it.
+
 ## GitHub Actions in a public repository
 
 After publication, add credentials in repository **Settings → Secrets and variables → Actions → Secrets** (not Variables). Gmail IMAP and OAuth are alternatives. No values are included in this folder or placed in workflow files. The automatic `GITHUB_TOKEN` handles the encrypted-state branch with `contents: write`; no personal access token is needed.
