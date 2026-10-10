@@ -45,6 +45,9 @@ logs/
 artifacts/
 exports/
 private/
+# Raw mail exports may contain tracking tokens and personal data anywhere.
+*.eml
+*.msg
 backups/
 *.bak
 *.zip

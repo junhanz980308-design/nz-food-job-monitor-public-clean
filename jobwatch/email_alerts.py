@@ -84,7 +84,8 @@ def new_mail_counters() -> dict:
                        non_job_emails=0, emails_acknowledged=0, emails_deferred=0,
                        unsupported_url_patterns=0, failure_reasons={}, url_patterns={},
                        link_decisions={}, link_occurrences=0, unique_link_targets=0,
-                       duplicate_links=0, canonical_card_reuse=0, redirect_requests=0,
+                       duplicate_links=0, canonical_card_reuse=0, structured_job_cards=0, unresolved_job_cards=0,
+                       mime_card_reuse=0, redirect_requests=0,
                        redirect_cache_hits=0, unresolved_job_targets=0, ambiguous_targets=0)
             for name in (*PLATFORM_DOMAINS, "Unknown")}
 
@@ -197,8 +198,100 @@ def title_value(value):
     return _valid_title(value) and not NAV_LABEL.fullmatch(value) and not MARKETING_LABEL.fullmatch(value)
 
 
+def _style(node, property_name):
+    return next((value.strip().lower() for declaration in node.get("style", "").split(";")
+                 if ":" in declaration for key, value in [declaration.split(":", 1)]
+                 if key.strip().lower() == property_name), "")
+
+
+def seek_card_fields(anchor):
+    """SEEK's linked table card: one emphasized title row, then employer row.
+
+    Inspect inside the link, never a neighboring card. Layout tables can be
+    deeply nested; font-size:0 on a layout cell does not hide its descendants.
+    This is structure recognition, not a job-keyword filter.
+    """
+    try:
+        if platform_for_host(urlparse(unwrap_target(anchor.get("href", ""))).hostname or "") != "SEEK":
+            return None
+    except (ValueError, TypeError):
+        return None
+    if not anchor.find("table") or anchor.find("a") or _style(anchor, "display") != "block":
+        return None
+    title_cells = [cell for cell in anchor.find_all("td")
+                   if _style(cell, "font-weight") in {"bold", "600", "700", "800", "900"}
+                   and any(_style(n, "text-decoration") == "underline" for n in cell.find_all("div"))]
+    if len(title_cells) != 1:
+        return None
+    cell = title_cells[0]
+    row = cell.parent
+    if row.name != "tr" or len(row.find_all("td", recursive=False)) != 1:
+        return None
+    employer_row = row.find_next_sibling("tr")
+    employers = employer_row.find_all("td", recursive=False) if employer_row else []
+    if len(employers) != 1 or employers[0].find("table"):
+        return None
+    title = cell.get_text(" ", strip=True)
+    company = employers[0].get_text(" ", strip=True)
+    strings = list(anchor.stripped_strings)
+    if not title or not company or strings[:2] != [title, company] or len(strings) < 3:
+        return None
+    return title, company
+
+
+TEXT_URL = re.compile(r'https?://[^\s<>\[\]"()]+')
+
+
+def text_links(text):
+    """Tokenize bracketed URLs and image/link pairs without retaining markup.
+
+    Context ends at the previous URL; a prior job cannot donate its title to
+    the following URL. Full context is used only for exact MIME card matching.
+    """
+    previous_end = 0
+    image_label = None
+    for match in TEXT_URL.finditer(text or ""):
+        adjacent_image = image_label is not None and text[previous_end:match.start()] == "]"
+        context = text[previous_end:match.start()].strip(" \n\r\t[]()")
+        previous_end = match.end()
+        lines = [line.strip(" []()") for line in context.splitlines() if line.strip(" []()")]
+        label = image_label if adjacent_image else (lines[-1] if lines else "")
+        # [image URL]destination URL is an inline image link, not two jobs.
+        image = text[max(0, match.start() - 1):match.start()] == "[" and bool(
+            re.match(r"\]https?://", text[match.end():]))
+        image_label = label if image else None
+        yield dict(href=match.group().rstrip(".,;)>"), label=label, context=context,
+                   image=image, bracketed=text[max(0, match.start() - 1):match.start()] == "[", anchor=None, card=None)
+
+
+def _seek_control(label):
+    # Finite UI patterns, never substrings of signed tracker tokens. These
+    # labels do not authorize requests to any additional domain.
+    if re.fullmatch(r"(?:SEEK|(?:www\.)?seek\.(?:co\.nz|com(?:\.au)?|nz)/?|(?:apple|app) store|google play|(?:edit|manage) (?:this |your )?alert|unsubscribe from (?:this |all )?alerts?|view all(?: [\d,]+)?(?: matching)? jobs)", label, re.I):
+        return "navigation"
+    if re.fullmatch(r"[a-z0-9.-]+/?", label, re.I) and platform_for_host(label.lower().rstrip("/")) == "SEEK":
+        return "navigation"
+    domains = re.findall(r"[\w.-]+\.(?:com(?:\.au)?|co\.nz)", label.lower())
+    if (any(platform_for_host(d) == "SEEK" for d in domains)
+            and re.search(r"\b(?:receiv\w*|sent)\b", label, re.I)
+            and re.search(r"\b(?:register\w*|subscrib\w*)\b", label, re.I)
+            and not JOB_ROLE.search(label)):
+        return "navigation"
+    if "©" in label and re.search(r"\bSEEK\b", label, re.I) and not JOB_ROLE.search(label):
+        return "navigation"
+    if re.fullmatch(r"explore now", label, re.I):
+        return "marketing"
+    if (len(label) <= 140 and re.search(r"\byour saved search results\b", label, re.I)
+            and re.search(r"relevant|personal|refine|customi[sz]e|tips|fine.?tune", label, re.I)
+            and not JOB_ROLE.search(label)):
+        return "marketing"
+    return None
+
+
 def job_card(anchor):
     """Smallest semantic card, growing table rows only while evidence stays singular."""
+    if seek_card_fields(anchor):
+        return anchor
     chosen = anchor
     for parent in list(anchor.parents)[:8]:
         if parent.name in {"body", "html", "[document]", "footer", "nav"}:
@@ -338,16 +431,35 @@ def prepare_links(html, text, platform, resolver, counter):
     tasks = []
     replacements = {}
     groups = {}
+    cards = []
     for anchor in soup.find_all("a", href=True):
+        fields = seek_card_fields(anchor) if platform == "SEEK" else None
+        if fields:
+            cards.append((anchor, fields))
         tasks.append(dict(href=anchor.get("href", ""), label=anchor_label(anchor), anchor=anchor, card=job_card(anchor)))
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    for i, line in enumerate(lines):
-        for match in re.finditer(r"https?://[^\s<>]+", line):
-            label = line[:match.start()].strip(" :-–") or (lines[i - 1] if i else "")
-            # A preceding URL is not evidence for the next link.
-            if re.search(r"https?://", label):
-                label = ""
-            tasks.append(dict(href=match.group().rstrip(".,;)>"), label=label, anchor=None, card=None))
+    counter["structured_job_cards"] += len(cards)
+    mime_targets = {}
+    card_titles = {fields[0] for _, fields in cards}
+    image_labels = {img.get("alt", "").strip() for img in soup.find_all("img")
+                    if img.get("alt", "").strip() and not JOB_ROLE.search(img.get("alt", ""))
+                    and img.get("alt", "").strip() not in card_titles
+                    and (not img.find_parent("a") or seek_card_fields(img.find_parent("a")))}
+    for task in text_links(text):
+        # Both title AND employer must occur consecutively in this URL's own
+        # text block, uniquely identifying an HTML card. Never pair by order.
+        lines = [re.sub(r"\s+", " ", line.strip()) for line in task["context"].splitlines() if line.strip()]
+        pairs = set(zip(lines, lines[1:]))
+        matches = [(anchor, fields) for anchor, fields in cards if fields in pairs]
+        if len(matches) == 1 and not task["image"]:
+            anchor, fields = matches[0]
+            task["card"] = anchor
+            task["label"] = fields[0]
+            direct = identify_job_url(task["href"])
+            if direct and direct[0] == platform:
+                mime_targets.setdefault(id(anchor), set()).add(direct)
+        if platform == "SEEK" and task["card"] is None and task["bracketed"] and task["label"] in image_labels:
+            task["image"] = True
+        tasks.append(task)
     counter["link_occurrences"] += len(tasks)
     for task in tasks:
         key = link_key(task["href"])
@@ -361,6 +473,12 @@ def prepare_links(html, text, platform, resolver, counter):
         direct = identify_job_url(href)
         if direct:
             return "canonical_job" if direct[0] == platform else "cross_platform_job"
+        if platform == "SEEK" and task.get("image"):
+            return "decorative_image"
+        if card is not None and seek_card_fields(card):
+            return "job_card"
+        if platform == "SEEK" and (control := _seek_control(label)):
+            return control
         if NAV_LABEL.fullmatch(label):
             return "navigation"
         if MARKETING_LABEL.fullmatch(label):
@@ -388,10 +506,13 @@ def prepare_links(html, text, platform, resolver, counter):
 
     def known_in_card(task):
         card = task["card"]
-        if card is None or card is task["anchor"]:
+        if card is None or (card is task["anchor"] and not seek_card_fields(card)):
             return None
-        known = {r[1]: r for a in card.find_all("a", href=True)
+        anchors = [card] if card.name == "a" else card.find_all("a", href=True)
+        known = {r[1]: r for a in anchors
                  if (r := identify_job_url(a.get("href", ""))) and r[0] == platform}
+        for r in mime_targets.get(id(card), set()):
+            known[r[1]] = r
         return next(iter(known.values())) if len(known) == 1 else None
 
     def replace(task, job):
@@ -399,14 +520,29 @@ def prepare_links(html, text, platform, resolver, counter):
             task["anchor"]["href"] = job[2]
         else:
             replacements[task["href"]] = job[2]
+        if task["card"] is not None and seek_card_fields(task["card"]):
+            if mime_targets.get(id(task["card"])):
+                counter["mime_card_reuse"] += 1
+            task["card"]["href"] = job[2]
 
-    priority = {"job_title": 0, "job_cta": 1, "card_link": 2, "unsupported_job_content": 3, "cross_platform_job": 3, "ambiguous_tracking": 4}
+    conflicting_cards = set()
+    for anchor, _ in cards:
+        identities = {r[1] for r in mime_targets.get(id(anchor), set())}
+        if direct := identify_job_url(anchor.get("href", "")):
+            identities.add(direct[1])
+        if len(identities) > 1:
+            conflicting_cards.add(id(anchor))
+    priority = {"job_card": 0, "job_title": 0, "job_cta": 1, "card_link": 2, "unsupported_job_content": 3, "cross_platform_job": 3, "ambiguous_tracking": 4}
     pending = []
-    missing = False
+    missing = bool(conflicting_cards)
+    if conflicting_cards:
+        for _ in conflicting_cards:
+            bump(counter, "failure_reasons", "ambiguous_card_identity")
+    card_failures = {}
     for key, items in groups.items():
         unresolved = []
         kinds = [classification(task) for task in items]
-        card_targets = {job[2]: job for task, kind in zip(items, kinds) if kind in {"job_title", "job_cta", "card_link"} and (job := known_in_card(task))}
+        card_targets = {job[2]: job for task, kind in zip(items, kinds) if kind in {"job_card", "job_title", "job_cta", "card_link"} and (job := known_in_card(task))}
         shared_card_target = next(iter(card_targets.values())) if len(card_targets) == 1 else None
         inherited_navigation = bool(set(kinds) & {"navigation", "marketing"}) and set(kinds) <= {"navigation", "marketing", "ambiguous_tracking", "other"}
         for task, kind in zip(items, kinds):
@@ -414,9 +550,11 @@ def prepare_links(html, text, platform, resolver, counter):
                 kind = "navigation"
             task["kind"] = kind
             bump(counter, "link_decisions", kind)
-            if kind in {"canonical_job", "navigation", "marketing", "other"}:
+            if id(task["card"]) in conflicting_cards:
                 continue
-            known = shared_card_target if kind in {"job_title", "job_cta", "card_link", "ambiguous_tracking"} and (task["anchor"] is None or known_in_card(task) == shared_card_target) else None
+            if kind in {"canonical_job", "navigation", "marketing", "other", "decorative_image"}:
+                continue
+            known = shared_card_target if kind in {"job_card", "job_title", "job_cta", "card_link", "ambiguous_tracking"} and (task["card"] is None or known_in_card(task) == shared_card_target) else None
             if known:
                 replace(task, known)
                 counter["canonical_card_reuse"] += 1
@@ -438,7 +576,7 @@ def prepare_links(html, text, platform, resolver, counter):
         if known:
             remaining_items = []
             for task in items:
-                if task["anchor"] is None or known_in_card(task) == known:
+                if task["card"] is None or known_in_card(task) == known:
                     replace(task, known)
                     counter["canonical_card_reuse"] += 1
                 else:
@@ -447,7 +585,10 @@ def prepare_links(html, text, platform, resolver, counter):
                 continue
             items = remaining_items
         ambiguous = rank == priority["ambiguous_tracking"]
-        if ambiguous:
+        failed_cards = {id(task["card"]) for task in items if id(task["card"]) in card_failures}
+        if failed_cards and all(id(task["card"]) in card_failures for task in items):
+            result, reason = None, "card_resolution_deferred"
+        elif ambiguous:
             result, reason = None, "insufficient_job_evidence"
             counter["ambiguous_targets"] += 1
         elif resolver is None:
@@ -462,11 +603,15 @@ def prepare_links(html, text, platform, resolver, counter):
                 replace(task, result)
         else:
             missing = True
+            for task in items:
+                if task["card"] is not None and seek_card_fields(task["card"]):
+                    card_failures[id(task["card"])] = reason
             counter["unsupported_url_patterns"] += 1
             counter["unresolved_job_targets"] += int(not ambiguous)
             bump(counter, "failure_reasons", reason)
-    for raw, clean in sorted(replacements.items(), key=lambda item: -len(item[0])):
-        text = text.replace(raw, clean)
+    counter["unresolved_job_cards"] += sum(id(anchor) in conflicting_cards or not identify_job_url(anchor.get("href", ""))
+                                           or not _valid_title(fields[0], minimum=2) for anchor, fields in cards)
+    text = TEXT_URL.sub(lambda match: replacements.get(match.group().rstrip(".,;)>"), match.group()), text)
     return str(soup), text, missing
 
 
@@ -474,11 +619,13 @@ def _card(anchor):
     return job_card(anchor)
 
 
-def _valid_title(value: str) -> bool:
-    return 7 <= len(value) <= 130 and not CTA.match(value) and not re.search(r"https?://|\S+@\S+", value)
+def _valid_title(value: str, minimum: int = 7) -> bool:
+    return minimum <= len(value) <= 130 and not CTA.match(value) and not re.search(r"https?://|\S+@\S+", value)
 
 
 def _best_title(anchor) -> tuple[str, str]:
+    if fields := seek_card_fields(anchor):
+        return fields
     value = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))
     if not _valid_title(value):
         value = anchor.get("aria-label", "") or anchor.get("title", "")
@@ -514,7 +661,7 @@ def extract_jobs_from_html(html: str) -> list[Job]:
             continue
         platform, ident, url = result
         title, company = _best_title(anchor)
-        if not _valid_title(title):
+        if not _valid_title(title, minimum=2 if seek_card_fields(anchor) else 7):
             continue
         card = _card(anchor).get_text(" ", strip=True)
         candidate = Job(source=f"{platform} email alert", source_id=ident, title=title,
@@ -527,17 +674,20 @@ def extract_jobs_from_html(html: str) -> list[Job]:
 
 def extract_jobs_from_text(text: str) -> list[Job]:
     jobs: dict[str, Job] = {}
-    lines = [s.strip() for s in (text or "").splitlines() if s.strip()]
-    for index, line in enumerate(lines):
-        match = re.search(r"https?://\S+", line)
-        if not match:
+    for task in text_links(text):
+        if task["image"]:
             continue
-        result = identify_job_url(match.group(0).rstrip(".,;)>"))
+        result = identify_job_url(task["href"])
         if not result:
             continue
         platform, ident, url = result
-        candidate = line[:match.start()].strip(" :-–") or (lines[index - 1] if index else "")
-        if _valid_title(candidate):
+        candidate = task["label"]
+        # Multiline SEEK card metadata is not a title. Its exact title/company
+        # pairing is handled against the structured HTML, never guessed here.
+        lines = [line.strip() for line in task["context"].splitlines() if line.strip()]
+        if len(lines) > 1 and not JOB_ROLE.search(candidate):
+            continue
+        if title_value(candidate):
             jobs[url] = Job(f"{platform} email alert", ident, candidate, description=candidate, url=url)
     return list(jobs.values())
 
@@ -592,11 +742,11 @@ def _parse_email(subject, sender, html, text, counters, resolver=None):
         text_jobs = extract_jobs_from_text(text)
         by_id = {(job.source, job.source_id): job for job in text_jobs + html_jobs}
         jobs = [j for j in by_id.values() if j.source == f"{platform} email alert"]
-        hrefs = [a.get("href", "") for a in _soup(html).find_all("a", href=True)] + re.findall(r"https?://[^\s<>]+", text)
+        hrefs = [a.get("href", "") for a in _soup(html).find_all("a", href=True)] + [t["href"] for t in text_links(text) if not t["image"]]
         supported = {r[1] for h in hrefs if (r := identify_job_url(h)) and r[0] == platform}
         missing_title = supported - {j.source_id for j in jobs}
         # Unsupported trackers alone do not prove marketing is a job alert.
-        recognized = recognized or bool(supported) or any(counter["link_decisions"].get(k, 0) > decisions_before.get(k, 0) for k in ("job_title", "job_cta", "unsupported_job_content", "cross_platform_job"))
+        recognized = recognized or bool(supported) or any(counter["link_decisions"].get(k, 0) > decisions_before.get(k, 0) for k in ("job_card", "job_title", "job_cta", "unsupported_job_content", "cross_platform_job"))
         if recognized and not _is_job_alert(subject, sender):
             counter["alerts_recognized"] += 1
         counter["links_extracted"] += len(jobs)

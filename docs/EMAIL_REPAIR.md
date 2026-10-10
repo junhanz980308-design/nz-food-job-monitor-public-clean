@@ -4,7 +4,7 @@
 
 The reported production counts show recognized SEEK alerts with zero extracted jobs. Code review confirmed that opaque links were never resolved, some card/title structures were unsupported, and both mailbox transports acknowledged messages even when extraction returned no jobs. Successful mailbox access was therefore reported as successful monitoring despite lost extraction. Previously acknowledged hashes also caused later scans to skip those emails.
 
-No private mailbox, real email body or tracking URL was accessed during this repair. Synthetic tests prove the supported code paths, not that every current platform template works. A reviewed, manually triggered diagnostic backfill is needed to confirm positive per-platform extraction against the actual mailbox. Zero Indeed/LinkedIn links alone does not establish those emails were job alerts.
+The initial repair used synthetic tests without accessing a private mailbox or original email samples. Synthetic tests prove the supported code paths, not that every current platform template works. A reviewed, manually triggered diagnostic backfill is needed to confirm positive per-platform extraction against the actual mailbox. Zero Indeed/LinkedIn links alone does not establish those emails were job alerts.
 
 ## Supported paths and privacy boundaries
 
@@ -80,3 +80,55 @@ Reasons for unresolved targets are counted once per normalized target per messag
 Synthetic regression tests contrast forty explicit marketing/navigation links (zero jobs, zero redirect requests) with forty opaque unexplained targets (still deferred, no assertion that they are jobs). They also cover canonical reuse, mixed MIME, prioritization, neighbor isolation, shared redirect hops and failure categories. These demonstrate the policy; they do not identify the actual targets in any private email. Confirm the remaining real-template issues with a separately approved, read-only diagnostic backfill. Do not use apply=true or resume scheduled monitoring as part of this review.
 
 This follow-up does not modify acknowledgements/retry storage logic, encryption, MONITOR_STATE_KEY, state history, Telegram, Adzuna or workflow schedules.
+
+
+## SEEK linked tables and MIME pairing
+
+SEEK also sends deeply nested tables inside a single block link. The title is
+an underlined division in a bold table cell; the next row explicitly names the
+employer. These are separate from location and salary rows. Treat the link as
+the card boundary, including when the title has no scientific-role keywords.
+Do not concatenate its metadata into the title or borrow from adjacent cards.
+
+Plain-text alternatives can carry bracketed canonical job URLs while HTML uses
+opaque trackers. Tokenize bracketed URLs and inline image/link pairs separately.
+Pair a text URL to an HTML card only when its own preceding text block contains
+the exact consecutive title and employer and that combination identifies one
+HTML card. Multiple identities for one card remain a conflict; duplicate
+combinations are not matched by order. Known MIME identities avoid network
+requests. Different unresolved MIME trackers for the same established card do
+not spend the request budget twice after a failure.
+
+SEEK home, app-store, alert-management, subscription and clearly labeled advice
+controls are classified independently of job cards. Bracketed image references
+are recognized using image syntax or corroborating HTML image labels. A generic
+unexplained footer tracker still causes deferral. No allowlist, sender validation,
+HTTPS, DNS, access-control or request limit is relaxed.
+
+Additional fixed counters:
+
+- `structured_job_cards`: recognized linked-table card occurrences, not a count
+  of every supported platform/template and not necessarily unique jobs.
+- `unresolved_job_cards`: those cards without an identifiable job, safe title,
+  or unambiguous MIME identity. The message remains deferred.
+- `mime_card_reuse`: replacements using a canonical identity from an exactly
+  matched text card. These are also included in `canonical_card_reuse`.
+- `job_card` and `decorative_image`: structural job evidence and image-only link
+  decisions, respectively.
+- `card_resolution_deferred`: another MIME link for an already failed card;
+  no additional request. Consult that card's original fixed failure category.
+
+A title failure is counted per message by `missing_title`, not per missing job.
+Aggregate historical extraction totals cannot identify which job was lost, or
+prove whether a changed count removed a false positive. Opaque-only identities
+cannot be verified by offline parsing; these alerts must stay deferred until a
+separately approved safe diagnostic can establish their destinations.
+
+The follow-up was checked locally against privately supplied samples with all
+network resolution disabled. Their contents and sample-derived diagnostics are
+not included in this repository. The committed fixtures are hand-written,
+synthetic structures. Automated tests cover MIME identity matching, nested title
+and employer extraction, navigation/image classification, conflicts, retries,
+old notification deduplication and a fully mocked dry-run that preserves state.
+No production history, acknowledgement, key, integration configuration or
+schedule is changed or executed by this repair.
