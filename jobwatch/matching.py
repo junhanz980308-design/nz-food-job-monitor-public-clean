@@ -13,9 +13,17 @@ TITLE_STRONG = [
     (r"\b(?:dairy|plant[ -]?based|flavou?r(?:s|ist)?|aroma|sensory)\b", 25, "乳品、植物基或香气领域", "title.specialism"),
     (r"\b(?:analytical scientist|analytical chemist|ingredients? scientist|applications? (?:technologist|scientist))\b", 34, "分析或原料技术", "title.analytical"),
     (r"\b(?:laboratory scientist|research officer|food innovation)\b", 18, "实验与创新相关", "title.laboratory"),
+    (r"\b(?:laboratory|lab) technicians?\b", 24, "实验室技术员", "title.lab_technician"),
 ]
 FOOD = r"\b(?:foods?|beverages?|dairy|milk|yogh?urt|cheese|nutrition|ingredients?|plant[ -]?based|fermentation|meat|grain|cereal|whey|casein)\b"
 ANALYTICAL = r"\b(?:gc[×x-]?gc(?:-tofms)?|gc[ -]?ms|lc[ -]?ms|mass spectrom\w*|chromatograph\w*|analytical chem\w*|chemometric\w*|volatiles?|flavou?r\w*|aroma|sensory)\b"
+# Additional methods apply only to lab technicians, leaving other role scores unchanged.
+LAB_ANALYTICAL = r"\b(?:hplc|uhplc|icp[ -]?ms)\b"
+LAB_UNRELATED = (
+    r"\b(?:clinical|patholog\w*|ha?ematolog\w*|histolog\w*|dental|patients?|"
+    r"medical (?:lab(?:oratory)?|diagnostics?)|veterinary diagnostics?|"
+    r"construction (?:lab(?:oratory)?|materials|testing)|concrete|geotechnical|software testing)\b"
+)
 DOMAIN = [
     (FOOD, 23, "食品与饮料行业", "evidence.food"),
     (r"\b(?:research|develop(?:ment|ing|s)?|r\s*(?:&|and)\s*d|npd|innovation|formulations?|product design)\b", 13, "研究开发工作", "evidence.development"),
@@ -83,8 +91,15 @@ def match_job(job: Job) -> Match:
             signals.append(signal)
     if not description or description == title:
         signals.append("context.title_only")
-    food = bool(re.search(FOOD, text))
+    lab_technician = "title.lab_technician" in signals
+    # Food benefits alone are not evidence of a food laboratory remit.
+    food = bool(re.search(FOOD, re.sub(QUALITY_PERKS, "", text) if lab_technician else text))
     relevant_tech = bool(re.search(ANALYTICAL, text))
+    if lab_technician and not relevant_tech and re.search(LAB_ANALYTICAL, text):
+        score += 18
+        relevant_tech = True
+        reasons.append("化学分析技术")
+        signals.append("evidence.lab_analytical")
     quality_title = bool(re.search(QUALITY_ROLE, title))
     quality = not hits and (quality_title or bool(re.search(QUALITY_DUTIES, description)))
     quality_food = bool(re.search(FOOD, re.sub(QUALITY_PERKS, "", text)))
@@ -97,9 +112,12 @@ def match_job(job: Job) -> Match:
         score = min(69, score + 24)
         reasons.append("食品质量、安全与合规职责" if quality_food else "质量或合规岗位，食品行业背景待确认")
         signals.append("title.quality" if quality_title else "evidence.quality_duties")
-    unrelated = bool(re.search(NEGATIVE_TITLE, title) or re.search(UNRELATED, text) or quality_unrelated)
+    lab_unrelated = lab_technician and bool(re.search(LAB_UNRELATED, text))
+    unrelated = bool(re.search(NEGATIVE_TITLE, title) or re.search(UNRELATED, text) or quality_unrelated or lab_unrelated)
     if quality_unrelated:
         signals.append("penalty.unrelated_quality")
+    if lab_unrelated:
+        signals.append("penalty.unrelated_lab")
     if unrelated:
         score -= 70
         signals.append("penalty.unrelated")
@@ -108,12 +126,12 @@ def match_job(job: Job) -> Match:
         signals.append("penalty.no_relevant_role")
     # NPD/R&D/formulation titles warrant POSSIBLE; generic research/analysis
     # needs food or specific analytical methods. More words alone aren't evidence.
-    ambiguous = (bool(hits) and not food and not relevant_tech and "title.development" not in signals) or (quality and not quality_food)
+    ambiguous = (bool(hits) and not food and not relevant_tech and (lab_technician or "title.development" not in signals)) or (quality and not quality_food)
     if ambiguous:
         score = min(score, 41)
         signals.append("context.insufficient_relevance")
-    if not food:
-        score = min(score, 69)  # No generic non-food role becomes HIGH.
+    if not food or lab_technician:
+        score = min(score, 69)  # Generic non-food and technician roles stay below HIGH.
     score = max(0, min(score, 100))
     rights_flag = "未核实；需向雇主确认是否接受海外申请者"
     restricted = bool(re.search(RIGHTS_STRICT, text))
