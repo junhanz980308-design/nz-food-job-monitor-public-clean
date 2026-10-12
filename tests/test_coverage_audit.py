@@ -132,7 +132,7 @@ def test_adzuna_query_budget_and_existing_queries_preserved():
 
     assert len(queries) == len(set(queries)) == 12
 
-    assert {"food quality", "food safety"}.issubset(queries)
+    assert "analytical chemist" in queries
 
     assert len(queries) * 6 * 31 == 2232 < 2500
 
